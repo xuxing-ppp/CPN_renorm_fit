@@ -1,0 +1,13 @@
+# system files
+.DS_Store
+.vscode/
+__pycache__/
+
+# legacy data and results
+/legacy/**/data/
+/legacy/**/results/
+/legacy/**/data_halfRefVil/
+/legacy/**/data_RefVil/
+/legacy/CPN_4plaq_fit/
+/legacy/**/configs/*
+!/legacy/**/configs/.gitkeep
