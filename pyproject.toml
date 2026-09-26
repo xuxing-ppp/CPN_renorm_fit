@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpn-renorm"
+version = "0.1.0"
+description = "Batched PyTorch/CUDA renormalization for the 2D CP(N-1) model"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26", "scipy>=1.12", "matplotlib>=3.8", "torch>=2.3",
+                "tqdm>=4.66"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+cpn-renorm = "cpn_renorm.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cpn_renorm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
