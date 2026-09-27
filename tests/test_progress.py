@@ -34,13 +34,20 @@ class ProgressTests(unittest.TestCase):
             with self.subTest(tty=tty), patch("cpn_renorm.progress.tqdm") as factory:
                 bar = factory.return_value
                 progress = SimulationProgress("test", stream=Stream(tty))
-                progress.phase("sampling", 10)
+                progress.phase("sampling", 10, unit="test")
+                bar.total = 10
+                progress.extend(3)
                 progress.update(2, ess="4.0/5")
+                progress.message("finished test")
                 progress.close()
                 self.assertEqual(factory.call_args.kwargs["leave"], False)
                 self.assertEqual(factory.call_args.kwargs["disable"], not tty)
                 bar.reset.assert_called_once_with(total=10)
+                self.assertEqual(bar.unit, "test")
+                self.assertEqual(bar.total, 13)
+                bar.refresh.assert_called_once_with()
                 bar.update.assert_called_once_with(2)
+                bar.write.assert_called_once_with("finished test", file=progress.stream)
                 bar.close.assert_called_once()
 
     def test_warmup_reports_adaptation_and_tau_diagnostics(self):

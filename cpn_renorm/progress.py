@@ -20,11 +20,18 @@ class SimulationProgress:
         self._bar = tqdm(total=0, desc=label, leave=False, dynamic_ncols=True,
                          disable=not visible, file=self.stream, unit="sweep")
 
-    def phase(self, name: str, total: int) -> None:
+    def phase(self, name: str, total: int, *, unit: str | None = None) -> None:
         """Reset the bar for a new phase without leaving the previous bar behind."""
         self._bar.set_description_str(f"{self.label} {name}", refresh=False)
+        if unit is not None:
+            self._bar.unit = unit
         self._bar.reset(total=max(int(total), 0))
         self._bar.set_postfix_str("", refresh=False)
+
+    def extend(self, count: int = 1) -> None:
+        """Add newly discovered work to an adaptive phase."""
+        self._bar.total = max(int(self._bar.total or 0) + int(count), 0)
+        self._bar.refresh()
 
     def update(self, count: int = 1, **metrics: object) -> None:
         if metrics:
@@ -32,6 +39,10 @@ class SimulationProgress:
                       if value is not None]
             self._bar.set_postfix_str(" ".join(fields), refresh=False)
         self._bar.update(int(count))
+
+    def message(self, value: str) -> None:
+        """Write a persistent line without corrupting the transient bar."""
+        self._bar.write(value, file=self.stream)
 
     def close(self) -> None:
         self._bar.close()

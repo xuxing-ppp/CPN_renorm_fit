@@ -10,12 +10,13 @@ import torch
 from .config import fingerprint, section
 from .sampler import BatchedHMCSampler, Couplings
 from .pilot import resolve_device, torch_dtype
-from .observables import autocorr_time, automatic_warmup
+from .observables import _z_link_phase, autocorr_time, automatic_warmup
 from .progress import SimulationProgress
 from .storage import atomic_npz
 
 
-PATCH_CACHE_SCHEMA = 2
+PATCH_CACHE_SCHEMA = 3
+TWO_PLAQ_ALGORITHM_REVISION = 2
 
 
 @dataclass(frozen=True)
@@ -235,11 +236,19 @@ def _boundary_data(zloop: torch.Tensor, aloop: torch.Tensor, L: int,
         a_u.append(_wrap(aloop[:, sl].sum(1)))
         indices = torch.arange(i * L, (i + 1) * L, device=zloop.device)
         nxt = (indices + 1) % (segments * L)
-        inner = torch.sum(torch.conj(zloop[:, indices]) * zloop[:, nxt], dim=-1)
-        a_z.append(_wrap(torch.angle(inner).sum(1)))
+        phase = _z_link_phase(zloop[:, indices], zloop[:, nxt])
+        a_z.append(_wrap(phase.sum(1)))
     au, az = torch.stack(a_u, 1), torch.stack(a_z, 1)
     corners = zloop[:, torch.arange(segments, device=zloop.device) * L]
     return au.cpu().numpy(), az.cpu().numpy(), corners.cpu().numpy()
+
+
+def _two_plaq_connections(sampler: BatchedHMCSampler, L: int) -> torch.Tensor:
+    """Return middle U/z connections, both oriented from bottom to top."""
+    conn_u = _wrap(sampler.a[:, L, :L, 1].sum(1))
+    phase_z = _z_link_phase(sampler.z[:, L, :-1], sampler.z[:, L, 1:])
+    conn_z = _wrap(phase_z.sum(1))
+    return torch.stack((conn_u, conn_z), -1)
 
 
 def _outer_boundary(cfg: dict, settings: dict, *, L: int, pad: int,
@@ -280,10 +289,7 @@ def _generate_two_plaq_batch_impl(cfg: dict, geometry: dict, batch_index: int,
     zloop, aloop = patch.zloop, patch.aloop
     warmup = _adapt_inner(sampler, patch, settings, progress=progress)
     def observe(item):
-        conn_u = _wrap(item.a[:, L, :L, 1].sum(1))
-        inner = torch.sum(torch.conj(sampler.z[:, L, 1:]) * sampler.z[:, L, :-1], -1)
-        conn_z = _wrap(torch.angle(inner).sum(1))
-        return torch.stack((conn_u, conn_z), -1).cpu().numpy()
+        return _two_plaq_connections(item, L).cpu().numpy()
     samples, sampling = _adaptive_samples(
         sampler, settings, observe,
         lambda values: np.concatenate((np.sin(values), np.cos(values)), axis=-1),
@@ -403,9 +409,47 @@ def _generate_one_plaq_batch_impl(cfg: dict, geometry: dict, batch_index: int,
 
 
 def _batch_key(cfg: dict, geometry: dict, stage: str, batch_index: int) -> str:
-    clean_cfg = {key: value for key, value in cfg.items() if not key.startswith("_")}
-    return fingerprint({"schema": PATCH_CACHE_SCHEMA, "stage": stage, "batch": batch_index,
-                        "config": clean_cfg, "geometry": geometry})
+    step = dict(cfg.get("steps", {}).get(stage, {}))
+    # These control aggregation/fitting, not the simulation of an individual batch.
+    step.pop("fit_times", None)
+    step.pop("p0", None)
+    payload = {
+        "schema": PATCH_CACHE_SCHEMA,
+        "stage": stage,
+        "batch": batch_index,
+        "model": cfg.get("model"),
+        "renormalization": cfg.get("renormalization"),
+        "runtime": cfg.get("runtime"),
+        "hmc": cfg.get("hmc"),
+        "geometry_config": cfg.get("geometry"),
+        "geometry": geometry,
+        "settings": step,
+        "chains": cfg.get("chains", {}).get(stage),
+    }
+    if stage == "two_plaq":
+        payload["algorithm_revision"] = TWO_PLAQ_ALGORITHM_REVISION
+    return fingerprint(payload)
+
+
+def patch_result_key(cfg: dict, geometry: dict, stage: str) -> str:
+    """Fingerprint a completed patch fit separately from its raw batches."""
+    settings = cfg["steps"][stage]
+    count = patch_batch_count(int(settings["fit_times"]),
+                              int(cfg["chains"][stage]))
+    payload = {
+        "schema": PATCH_CACHE_SCHEMA,
+        "stage": stage,
+        "batches": [_batch_key(cfg, geometry, stage, index)
+                    for index in range(count)],
+        "fit_times": settings["fit_times"],
+        "p0": settings.get("p0"),
+        "renormalization_type": cfg["renormalization"]["type"],
+        "N": cfg["model"]["N"],
+        "diagnostics": cfg["diagnostics"],
+    }
+    if stage == "two_plaq":
+        payload["algorithm_revision"] = TWO_PLAQ_ALGORITHM_REVISION
+    return fingerprint(payload)
 
 
 def _batch_summary(stage: str, batch_index: int, result: dict) -> str | None:

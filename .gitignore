@@ -11,3 +11,9 @@ __pycache__/
 /legacy/CPN_4plaq_fit/
 /legacy/**/configs/*
 !/legacy/**/configs/.gitkeep
+
+# config files and run results
+/configs/*
+!/configs/example.toml
+/runs/*
+!/runs/.gitkeep

@@ -11,7 +11,9 @@ from typing import Any
 
 DEFAULTS: dict[str, Any] = {
     "runtime": {"device": "auto", "dtype": "float64", "seed": 1729},
-    "pilot": {"chains": 16, "initial_L": 16, "max_L": 256,
+    "chains": {"pilot": 16, "two_plaq": 32, "observable": 16,
+               "one_plaq": 32, "topo": 16},
+    "pilot": {"initial_L": 16, "max_L": 256,
               "min_L_over_xi": 8.0,
               "growth_factor": 2.0, "min_warmup": 300, "max_warmup": 4000,
               "min_meas_total": 4800, "target_ess": 200,
@@ -25,24 +27,32 @@ DEFAULTS: dict[str, Any] = {
     "diagnostics": {"min_accept": 0.50, "max_accept": 0.95,
                     "strict": False},
     "scan": {"beta1": {"min": -8.0, "max": 8.0,
-                         "growth_factor": 2.0, "max_rounds": 7},
+                         "growth_factor": 2.0, "max_rounds": 7,
+                         "refine_tolerance": 0.02, "max_refine_rounds": 10,
+                         "fit_points": 5, "fit_sigma_multiplier": 3.0,
+                         "fit_spacing_min": 0.01, "fit_spacing_max": 0.05,
+                         "fit_confidence_sigma": 2.0, "max_fit_grid_rounds": 3},
              "alpha": {"min": 0.001, "max": 8.0,
-                       "growth_factor": 2.0, "max_rounds": 7}},
+                       "growth_factor": 2.0, "max_rounds": 7,
+                       "refine_tolerance": 0.002, "max_refine_rounds": 10,
+                       "fit_points": 5, "fit_sigma_multiplier": 3.0,
+                       "fit_spacing_min": 0.0015, "fit_spacing_max": 0.006,
+                       "fit_confidence_sigma": 2.0, "max_fit_grid_rounds": 3}},
     "steps": {
-        "two_plaq": {"chains": 32, "fit_times": 5000,
+        "two_plaq": {"fit_times": 5000,
                      "min_warmup": 400, "max_warmup": 4000,
                      "min_meas_per_boundary": 3000,
                      "target_ess_per_boundary": 500,
                      "max_meas_per_boundary": 12000, "bins": 60},
-        "observable": {"chains": 16, "min_warmup": 500, "max_warmup": 6000,
+        "observable": {"min_warmup": 500, "max_warmup": 6000,
                        "min_meas_total": 8000, "target_ess": 200,
                        "max_meas_total": 32000},
-        "one_plaq": {"chains": 32, "fit_times": 2000,
+        "one_plaq": {"fit_times": 2000,
                      "min_warmup": 400, "max_warmup": 4000,
                      "min_meas_per_boundary": 1000,
                      "target_ess_per_boundary": 500,
                      "max_meas_per_boundary": 4000, "zero_pad": 1},
-        "topo": {"chains": 16, "min_warmup": 1000, "max_warmup": 12000,
+        "topo": {"min_warmup": 1000, "max_warmup": 12000,
                  "min_meas_total": 16000, "target_ess": 100,
                  "max_meas_total": 64000},
     },
@@ -106,8 +116,13 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if cfg["runtime"]["dtype"] not in ("float32", "float64"):
         raise ValueError("runtime.dtype must be float32 or float64")
     if "chains" in cfg["runtime"]:
-        raise ValueError("runtime.chains is not used; set pilot.chains and steps.<name>.chains")
+        raise ValueError("runtime.chains is not used; configure the [chains] section")
+    if "chains" in cfg["pilot"]:
+        raise ValueError("pilot.chains is not used; set chains.pilot")
     for name, settings in cfg["steps"].items():
+        if "chains" in settings:
+            raise ValueError(
+                f"steps.{name}.chains is not used; set chains.{name}")
         duplicated_hmc = sorted(set(settings) & set(cfg["hmc"]))
         if duplicated_hmc:
             key = duplicated_hmc[0]
@@ -123,19 +138,34 @@ def validate_config(cfg: dict[str, Any]) -> None:
         if points and (len(set(points)) < 2 or any(x < scan["min"] or x > scan["max"]
                                                    for x in points)):
             raise ValueError(f"scan.{name}.points need at least two unique values inside min/max")
+        if float(scan["growth_factor"]) <= 0 or int(scan["max_rounds"]) < 0:
+            raise ValueError(f"scan.{name} expansion settings are invalid")
+        fit_points = int(scan["fit_points"])
+        if (float(scan["refine_tolerance"]) <= 0 or
+                int(scan["max_refine_rounds"]) < 0 or fit_points < 3 or
+                fit_points % 2 == 0):
+            raise ValueError(f"scan.{name} refinement settings are invalid")
+        spacing_min = float(scan["fit_spacing_min"])
+        spacing_max = float(scan["fit_spacing_max"])
+        if (spacing_min <= 0 or spacing_max < spacing_min or
+                float(scan["fit_sigma_multiplier"]) <= 0 or
+                float(scan["fit_confidence_sigma"]) <= 0 or
+                int(scan["max_fit_grid_rounds"]) < 0 or
+                spacing_min * (fit_points - 1) > float(scan["max"] - scan["min"])):
+            raise ValueError(f"scan.{name} fit-grid settings are invalid")
     if cfg["scan"]["alpha"]["min"] < 0:
         raise ValueError("scan.alpha.min must be non-negative")
+    chain_names = ("pilot", "two_plaq", "observable", "one_plaq", "topo")
+    for name in chain_names:
+        if int(cfg["chains"].get(name, 0)) < 1:
+            raise ValueError(f"chains.{name} must be positive")
     pilot = cfg["pilot"]
     if pilot["initial_L"] > pilot["max_L"] or pilot["min_L_over_xi"] <= 0:
         raise ValueError("invalid pilot lattice limits")
-    if int(pilot["chains"]) < 1:
-        raise ValueError("pilot.chains must be positive")
     aggregate_sections = [("pilot", cfg["pilot"])] + [
         (name, cfg["steps"][name]) for name in ("observable", "topo")]
     for name, settings in aggregate_sections:
         prefix = name if name == "pilot" else f"steps.{name}"
-        if int(settings["chains"]) < 1:
-            raise ValueError(f"{prefix}.chains must be positive")
         if any(int(settings[key]) < 1 for key in
                ("min_warmup", "max_warmup", "min_meas_total", "max_meas_total")):
             raise ValueError(f"{prefix} sampling counts must be positive")
@@ -154,8 +184,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
             raise ValueError(
                 f"{prefix}.{legacy_totals[0]} is not valid for frozen-boundary fits; "
                 "use the corresponding *_per_boundary field")
-        if int(settings["chains"]) < 1 or int(settings["fit_times"]) < 1:
-            raise ValueError(f"{prefix}.chains and fit_times must be positive")
+        if int(settings["fit_times"]) < 1:
+            raise ValueError(f"{prefix}.fit_times must be positive")
         if any(int(settings[key]) < 1 for key in
                ("min_warmup", "max_warmup", "min_meas_per_boundary",
                 "max_meas_per_boundary")):
@@ -208,4 +238,7 @@ def fingerprint(payload: dict[str, Any]) -> str:
 
 def section(cfg: dict[str, Any], step: str) -> dict[str, Any]:
     """Return shared runtime/HMC settings plus one step's sampling budget."""
-    return _merge(_merge(cfg["runtime"], cfg["hmc"]), cfg["steps"][step])
+    local = cfg["pilot"] if step == "pilot" else cfg["steps"][step]
+    settings = _merge(_merge(cfg["runtime"], cfg["hmc"]), local)
+    settings["chains"] = int(cfg["chains"][step])
+    return settings

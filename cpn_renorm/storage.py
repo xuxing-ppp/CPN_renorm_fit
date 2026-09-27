@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,23 @@ def atomic_checkpoint(path: str | Path, value: Any) -> None:
     try:
         torch.save(value, tmp)
         os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def atomic_copy(source: str | Path, destination: str | Path) -> None:
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=destination.name, suffix=".tmp",
+                               dir=destination.parent)
+    os.close(fd)
+    try:
+        shutil.copy2(source, tmp)
+        os.replace(tmp, destination)
     except Exception:
         try:
             os.unlink(tmp)

@@ -10,6 +10,11 @@ from .sampler import BatchedHMCSampler
 from .progress import SimulationProgress
 
 
+def _z_link_phase(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """Return the forward Berry-link phase ``arg(<left|right>)``."""
+    return torch.angle(torch.sum(torch.conj(left) * right, dim=-1))
+
+
 def projector_structure(sampler: BatchedHMCSampler) -> torch.Tensor:
     z, N = sampler.z, sampler.N
     proj = z[..., :, None] * torch.conj(z[..., None, :])
@@ -74,9 +79,8 @@ def rectangular_loops(sampler: BatchedHMCSampler,
     if not sampler.periodic:
         raise ValueError("loop observables require PBC")
     z = sampler.z
-    zx = torch.sum(torch.conj(torch.roll(z, -1, 1)) * z, dim=-1)
-    zy = torch.sum(torch.conj(torch.roll(z, -1, 2)) * z, dim=-1)
-    zlink = torch.stack((torch.angle(zx), torch.angle(zy)), dim=-1)
+    zlink = torch.stack((_z_link_phase(z, torch.roll(z, -1, 1)),
+                         _z_link_phase(z, torch.roll(z, -1, 2))), dim=-1)
     out: dict[str, dict[str, torch.Tensor]] = {}
     for dx, dy in sizes:
         if not (0 <= dx < sampler.Lx and 0 <= dy < sampler.Ly):

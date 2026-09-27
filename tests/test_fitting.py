@@ -1,8 +1,17 @@
 import numpy as np
 import unittest
 
-from cpn_renorm.fitting import extend_scan, match_coupling
-from cpn_renorm.fit_client import isolated_match
+from cpn_renorm.fit_client import extend_scan, isolated_match
+
+
+def match_coupling(*args, **kwargs):
+    return isolated_match(*args, **kwargs)
+
+
+def evaluate_match_curve(match, x):
+    coeff = np.asarray(match["fit_coefficients"])
+    scaled = (np.asarray(x) - match["fit_center"]) / match["fit_scale"]
+    return np.polynomial.polynomial.polyval(scaled, coeff)
 
 
 class FittingTests(unittest.TestCase):
@@ -40,6 +49,28 @@ class FittingTests(unittest.TestCase):
         result = isolated_match(x, x ** 3 + x, 0.2,
                                 np.full(len(x), 0.05), target_err=0.1)
         self.assertTrue(result["bracketed"])
-        self.assertEqual(result["fit_type"], "gcv_smoothing_spline")
+        self.assertEqual(result["fit_type"], "monotonic_weighted_poly_2")
         self.assertEqual(result["raw_bracket"], [0.0, 1.0])
         self.assertGreater(result["error"], 0)
+        self.assertLessEqual(len(result["fit_points"]), 5)
+
+    def test_local_fit_is_monotonic_and_ignores_distant_points(self):
+        x = np.arange(9, dtype=float)
+        y = np.array([-100.0, -50.0, 0.0, 1.0, 2.0, 3.0, 4.0, 60.0, 100.0])
+        result = match_coupling(x, y, 2.4, np.full(len(x), 0.1),
+                                increasing=True, max_points=5)
+        grid = np.linspace(min(result["fit_points"]), max(result["fit_points"]), 101)
+        self.assertTrue(np.all(np.diff(evaluate_match_curve(result, grid)) >= -1e-9))
+        self.assertEqual(len(result["fit_points"]), 5)
+        self.assertNotIn(0.0, result["fit_points"])
+        self.assertNotIn(8.0, result["fit_points"])
+
+    def test_decreasing_fit_and_uncertainty(self):
+        x = np.arange(5, dtype=float)
+        y = np.array([5.0, 4.2, 3.0, 2.1, 1.0])
+        small = match_coupling(x, y, 2.5, np.full(5, 0.02), 0.02,
+                               increasing=False, bootstrap_seed=7)
+        large = match_coupling(x, y, 2.5, np.full(5, 0.2), 0.2,
+                               increasing=False, bootstrap_seed=7)
+        self.assertEqual(small["monotonic"], "decreasing")
+        self.assertGreater(large["error"], small["error"])

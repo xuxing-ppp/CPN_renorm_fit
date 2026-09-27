@@ -17,16 +17,23 @@ dtype = "float64"
 # All batch seeds are deterministic offsets from this seed, so resumed runs reproduce data.
 seed = 1018
 
+[chains]
+# GPU batch widths by pipeline stage. Paste tune-chains suggestions here.
+pilot = 32
+two_plaq = 2048
+observable = 128
+one_plaq = 2048
+topo = 256
+
 [pilot]
 # Pilot chains are independent PBC replicas used only to estimate xi.
-chains = 32
 initial_L = 32
 max_L = 128
 # Increase L until L / (xi + 2*xi_err) reaches this threshold.
 min_L_over_xi = 2.0
 growth_factor = 2.0
 # Warmup and production stop adaptively between these limits.
-min_warmup = 300
+min_warmup = 400
 max_warmup = 4000
 # Unlike frozen-boundary fits below, these measurement counts are totals across chains.
 min_meas_total = 10000
@@ -40,8 +47,8 @@ padding = -1
 # A value >= 2 fixes the observable coarse lattice; -1 derives it from obs_L_xi_mul.
 coarse_L = -1
 # These multipliers are consulted only when the corresponding override is -1.
-padding_xi_mul = 1.0
-obs_L_xi_mul = 6.0
+padding_xi_mul = 2.0
+obs_L_xi_mul = 10.0
 
 [hmc]
 # epsilon is the initial/adaptation value. trajectory_length remains fixed while
@@ -55,7 +62,7 @@ adapt_steps = 200
 # This tunes epsilon for both outer lattices and inner patches. Inner patches then
 # restore the cropped equilibrium state and start production without another warmup.
 # Outer warmup stops when tau is long enough and stable within this tolerance.
-warmup_tau_multiplier = 5.0
+warmup_tau_multiplier = 40
 tau_stability_rtol = 0.25
 s_step = 1.0
 s_updates = 3
@@ -73,6 +80,16 @@ max = 8.0
 points = []
 growth_factor = 2.0
 max_rounds = 7
+# Once a target is bracketed, bisect until the coupling interval is this narrow.
+refine_tolerance = 0.02
+max_refine_rounds = 10
+# Build an odd, uniform final grid from the preliminary bootstrap coupling error.
+fit_points = 5
+fit_sigma_multiplier = 3.0
+fit_spacing_min = 0.01
+fit_spacing_max = 0.05
+fit_confidence_sigma = 2.0
+max_fit_grid_rounds = 3
 
 [scan.alpha]
 min = 0.001
@@ -80,11 +97,18 @@ max = 8.0
 points = []
 growth_factor = 2.0
 max_rounds = 7
+refine_tolerance = 0.002
+max_refine_rounds = 10
+fit_points = 5
+fit_sigma_multiplier = 3.0
+fit_spacing_min = 0.0015
+fit_spacing_max = 0.006
+fit_confidence_sigma = 2.0
+max_fit_grid_rounds = 3
 
 [steps.two_plaq]
 # chains is GPU batch width, not the number of fitted boundaries. fit_times is
-# rounded upward to a whole batch: 5000 with 32 chains produces 5024 boundaries.
-chains = 32
+# rounded upward to a whole batch.
 fit_times = 5000
 # These warmup limits apply only to the outer boundary lattice. The inner patch
 # uses adapt_steps above to tune epsilon on a random interior, then restores the
@@ -93,8 +117,8 @@ min_warmup = 400
 max_warmup = 4000
 # Every boundary receives at least this many samples. A batch stops together
 # after every chain reaches target ESS, or at max_meas_per_boundary.
-min_meas_per_boundary = 3000 # 60 bins * 50 samples/bin from the reference JSON.
-target_ess_per_boundary = 500
+min_meas_per_boundary = 3000
+target_ess_per_boundary = 600
 max_meas_per_boundary = 12000
 bins = 60
 p0 = [2.0, 0.0]
@@ -102,7 +126,6 @@ p0 = [2.0, 0.0]
 [steps.observable]
 # Observable/topology stages do not use frozen boundaries; their measurement
 # budgets remain aggregate totals shared across chains.
-chains = 20
 min_warmup = 1000
 max_warmup = 6000
 min_meas_total = 100000
@@ -110,21 +133,19 @@ target_ess = 5000
 max_meas_total = 400000
 
 [steps.one_plaq]
-# Same batching and per-boundary semantics as two_plaq; this becomes 2016 boundaries.
-chains = 32
+# Same batching and per-boundary semantics as two_plaq.
 fit_times = 2000
 min_warmup = 400
 max_warmup = 4000
 min_meas_per_boundary = 1000
-target_ess_per_boundary = 500
+target_ess_per_boundary = 200
 max_meas_per_boundary = 4000
 zero_pad = 1
 p0 = 1.0
 
 [steps.topo]
-chains = 20
-min_warmup = 1000
-max_warmup = 12000
+min_warmup = 400
+max_warmup = 4000
 min_meas_total = 100000
 target_ess = 5000
 max_meas_total = 400000

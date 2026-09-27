@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from .config import resolved_geometry
+from .config import resolved_geometry, section
 from .observables import measure_ensemble
 from .progress import SimulationProgress, ensemble_summary
 from .sampler import BatchedHMCSampler, Couplings
@@ -46,13 +46,14 @@ def fine_sampler(cfg: dict, L: int, settings: dict, *, seed_offset: int = 0,
 
 def run_pilot(cfg: dict, run_dir: str | Path) -> dict:
     p = cfg["pilot"]
-    settings = cfg["runtime"] | cfg["hmc"] | p
+    settings = section(cfg, "pilot")
     L, attempts = int(p["initial_L"]), []
     run_dir = Path(run_dir)
     result_path = run_dir / "pilot" / "result.json"
     pilot_key = fingerprint({"model": cfg["model"], "renormalization": cfg["renormalization"],
                              "runtime": cfg["runtime"], "pilot": p, "hmc": cfg["hmc"],
-                             "schema": 3})
+                             "chains": cfg["chains"]["pilot"],
+                             "geometry": cfg["geometry"], "schema": 4})
     if result_path.exists() and not cfg.get("_force"):
         existing = __import__("json").loads(result_path.read_text(encoding="utf-8"))
         if existing.get("fingerprint") == pilot_key:

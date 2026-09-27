@@ -4,7 +4,7 @@ import unittest
 import torch
 
 from cpn_renorm.sampler import BatchedHMCSampler, Couplings
-from cpn_renorm.observables import topo_charge
+from cpn_renorm.observables import _z_link_phase, rectangular_loops, topo_charge
 
 
 def make(kind="half", alpha=0.4, alpha1=0.0):
@@ -14,6 +14,22 @@ def make(kind="half", alpha=0.4, alpha1=0.0):
 
 
 class SamplerTests(unittest.TestCase):
+    def test_z_link_phase_uses_forward_bra_ket_orientation(self):
+        left = torch.tensor([[1 + 0j, 0j]], dtype=torch.complex128)
+        right = torch.tensor([[1j, 0j]], dtype=torch.complex128)
+        self.assertAlmostEqual(float(_z_link_phase(left, right)), math.pi / 2)
+
+    def test_rectangular_z_loop_matches_forward_legacy_formula(self):
+        sampler = make()
+        measured = rectangular_loops(sampler, [(1, 1)])["1x1"]["z"]
+        z = sampler.z
+        vdot = lambda left, right: torch.sum(torch.conj(left) * right, dim=-1)
+        zx, zy = torch.roll(z, -1, 1), torch.roll(z, -1, 2)
+        zxy = torch.roll(z, (-1, -1), (1, 2))
+        loop = vdot(z, zx) * vdot(zx, zxy) * vdot(zxy, zy) * vdot(zy, z)
+        expected = torch.cos(torch.angle(loop)).mean((1, 2))
+        self.assertTrue(torch.allclose(measured, expected, atol=1e-12, rtol=1e-12))
+
     def test_trajectory_length_survives_step_changes_and_checkpoint(self):
         sampler = BatchedHMCSampler(chains=1, Lx=3, Ly=3, N=2,
             couplings=Couplings(0.7, 0.0, 0.4), dtype=torch.float64,

@@ -26,21 +26,36 @@ def isolated_fit(operation: str, request: dict, **arrays: np.ndarray) -> dict:
 
 def isolated_match(x: np.ndarray, y: np.ndarray, target: float,
                    y_err: np.ndarray | None = None,
-                   target_err: float | None = None) -> dict:
+                   target_err: float | None = None, *, increasing: bool = True,
+                   max_points: int = 5, bootstrap_seed: int = 1729,
+                   bootstrap_samples: int = 256) -> dict:
     arrays = {"x": np.asarray(x), "y": np.asarray(y)}
     if y_err is not None:
         arrays["y_err"] = np.asarray(y_err)
-    return isolated_fit("match", {"target": float(target),
+    return isolated_fit("match", {"target": float(target), "increasing": increasing,
+                        "max_points": int(max_points), "bootstrap_seed": int(bootstrap_seed),
+                        "bootstrap_samples": int(bootstrap_samples),
                         "target_err": (None if target_err is None else float(target_err))},
                         **arrays)
 
 
 def isolated_plot(destination: str | Path, *, x: np.ndarray,
                   series: dict[str, np.ndarray], targets: dict[str, float],
-                  xlabel: str, ylabel: str) -> None:
+                  xlabel: str, ylabel: str,
+                  errors: dict[str, np.ndarray] | None = None,
+                  matches: dict[str, dict] | None = None,
+                  colors: dict[str, str] | None = None) -> None:
+    arrays = {"x": np.asarray(x), **series}
+    error_keys = {}
+    for key, value in (errors or {}).items():
+        array_key = f"error__{key}"
+        arrays[array_key] = np.asarray(value)
+        error_keys[key] = array_key
     isolated_fit("plot", {"destination": str(Path(destination).resolve()),
                  "series": list(series), "targets": targets,
-                 "xlabel": xlabel, "ylabel": ylabel}, x=np.asarray(x), **series)
+                 "errors": error_keys, "matches": matches or {},
+                 "colors": colors or {}, "xlabel": xlabel, "ylabel": ylabel},
+                 **arrays)
 
 
 def extend_scan(points: list[float], result: dict, limits: tuple[float, float],
