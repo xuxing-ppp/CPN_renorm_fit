@@ -15,7 +15,7 @@ from .progress import SimulationProgress
 from .storage import atomic_npz
 
 
-PATCH_CACHE_SCHEMA = 3
+PATCH_CACHE_SCHEMA = 4
 TWO_PLAQ_ALGORITHM_REVISION = 2
 
 
@@ -127,19 +127,31 @@ def patch_batch_count(fit_times: int, chains: int) -> int:
 
 def _extract_rectangle(sampler: BatchedHMCSampler, width: int, height: int,
                        pad: int) -> RectanglePatch:
-    if pad < 0 or pad + width >= sampler.Lx or pad + height >= sampler.Ly:
-        raise ValueError("rectangle does not fit inside the sampler lattice")
-    z, U, p = sampler.z, sampler.U, pad
-    zloop = torch.cat((z[:, p:p + width, p], z[:, p + width, p:p + height],
-                       torch.flip(z[:, p + 1:p + width + 1, p + height], (1,)),
-                       torch.flip(z[:, p, p + 1:p + height + 1], (1,))), dim=1)
-    uloop = torch.cat((U[:, p:p + width, p, 0], U[:, p + width, p:p + height, 1],
-                       torch.flip(torch.conj(U[:, p:p + width, p + height, 0]), (1,)),
-                       torch.flip(torch.conj(U[:, p, p:p + height, 1]), (1,))), dim=1)
+    if pad < 0:
+        raise ValueError("rectangle padding must be nonnegative")
+    if sampler.periodic:
+        if width > sampler.Lx or height > sampler.Ly:
+            raise ValueError("rectangle does not fit inside the periodic sampler lattice")
+        ix = torch.arange(pad, pad + width + 1, device=sampler.device) % sampler.Lx
+        iy = torch.arange(pad, pad + height + 1, device=sampler.device) % sampler.Ly
+    else:
+        if pad + width >= sampler.Lx or pad + height >= sampler.Ly:
+            raise ValueError("rectangle does not fit inside the sampler lattice")
+        ix = torch.arange(pad, pad + width + 1, device=sampler.device)
+        iy = torch.arange(pad, pad + height + 1, device=sampler.device)
+    z = sampler.z.index_select(1, ix).index_select(2, iy)
+    a = sampler.a.index_select(1, ix).index_select(2, iy)
+    sx, sy = ix[:-1], iy[:-1]
+    s = sampler.s.index_select(1, sx).index_select(2, sy)
+    U = torch.exp(1j * a)
+    zloop = torch.cat((z[:, :width, 0], z[:, width, :height],
+                       torch.flip(z[:, 1:width + 1, height], (1,)),
+                       torch.flip(z[:, 0, 1:height + 1], (1,))), dim=1)
+    uloop = torch.cat((U[:, :width, 0, 0], U[:, width, :height, 1],
+                       torch.flip(torch.conj(U[:, :width, height, 0]), (1,)),
+                       torch.flip(torch.conj(U[:, 0, :height, 1]), (1,))), dim=1)
     return RectanglePatch(
-        z=z[:, p:p + width + 1, p:p + height + 1].detach().clone(),
-        a=sampler.a[:, p:p + width + 1, p:p + height + 1].detach().clone(),
-        s=sampler.s[:, p:p + width, p:p + height].detach().clone(),
+        z=z.detach().clone(), a=a.detach().clone(), s=s.detach().clone(),
         zloop=zloop.detach().clone(),
         aloop=torch.angle(uloop).detach().clone())
 
@@ -257,8 +269,6 @@ def _outer_boundary(cfg: dict, settings: dict, *, L: int, pad: int,
                     ) -> tuple[RectanglePatch, dict]:
     bc = cfg["geometry"]["boundary_bc"]
     periodic = bc == "PBC"
-    if periodic and pad < 1:
-        raise ValueError("automatic geometry requires padding >= 1 for PBC patches")
     add = 0 if periodic else 1
     outer = _make_sampler(cfg, settings, chains=int(settings["chains"]),
                           Lx=width + 2 * pad + add, Ly=height + 2 * pad + add,
@@ -353,8 +363,6 @@ def _generate_one_plaq_batch_impl(cfg: dict, geometry: dict, batch_index: int,
     settings = section(cfg, "one_plaq")
     L, pad = int(cfg["renormalization"]["factor"]), int(geometry["padding"])
     c, kind = _fine_couplings(cfg, fold_alpha=False)
-    if cfg["renormalization"]["type"] == "U" and kind != "full":
-        raise RuntimeError("U-renorm with alpha_f=0 has no constrained s sector")
     patch, outer_warmup = _outer_boundary(
         cfg, settings, L=L, pad=pad, width=L, height=L,
         couplings=c, kind=kind, seed_offset=30_000 + 2 * batch_index,
@@ -418,7 +426,7 @@ def _batch_key(cfg: dict, geometry: dict, stage: str, batch_index: int) -> str:
         "stage": stage,
         "batch": batch_index,
         "model": cfg.get("model"),
-        "renormalization": cfg.get("renormalization"),
+        "renormalization": {"factor": cfg.get("renormalization", {}).get("factor")},
         "runtime": cfg.get("runtime"),
         "hmc": cfg.get("hmc"),
         "geometry_config": cfg.get("geometry"),
@@ -429,6 +437,32 @@ def _batch_key(cfg: dict, geometry: dict, stage: str, batch_index: int) -> str:
     if stage == "two_plaq":
         payload["algorithm_revision"] = TWO_PLAQ_ALGORITHM_REVISION
     return fingerprint(payload)
+
+
+def _legacy_batch_keys(cfg: dict, geometry: dict, stage: str,
+                       batch_index: int) -> set[str]:
+    """Return schema-3 keys whose raw arrays are type-independent."""
+    step = dict(cfg.get("steps", {}).get(stage, {}))
+    step.pop("fit_times", None)
+    step.pop("p0", None)
+    old_geometry = dict(cfg.get("geometry", {}))
+    for suffix in ("padding_min", "padding_max", "coarse_L_min", "coarse_L_max"):
+        old_geometry.pop(suffix, None)
+    keys = set()
+    for renorm_type in ("U", "z"):
+        payload = {
+            "schema": 3, "stage": stage, "batch": batch_index,
+            "model": cfg.get("model"),
+            "renormalization": {"type": renorm_type,
+                                "factor": cfg.get("renormalization", {}).get("factor")},
+            "runtime": cfg.get("runtime"), "hmc": cfg.get("hmc"),
+            "geometry_config": old_geometry, "geometry": geometry,
+            "settings": step, "chains": cfg.get("chains", {}).get(stage),
+        }
+        if stage == "two_plaq":
+            payload["algorithm_revision"] = TWO_PLAQ_ALGORITHM_REVISION
+        keys.add(fingerprint(payload))
+    return keys
 
 
 def patch_result_key(cfg: dict, geometry: dict, stage: str) -> str:
@@ -443,7 +477,6 @@ def patch_result_key(cfg: dict, geometry: dict, stage: str) -> str:
                     for index in range(count)],
         "fit_times": settings["fit_times"],
         "p0": settings.get("p0"),
-        "renormalization_type": cfg["renormalization"]["type"],
         "N": cfg["model"]["N"],
         "diagnostics": cfg["diagnostics"],
     }
@@ -478,11 +511,21 @@ def _load_or_generate_batch(cfg: dict, geometry: dict, *, stage: str,
     path = None if cache_dir is None else cache_dir / f"batch_{batch_index:05d}.npz"
     if path is not None and path.exists() and not cfg.get("_force"):
         try:
+            upgrade = False
             with np.load(path, allow_pickle=False) as stored:
-                if str(stored["batch_fingerprint"].item()) == key:
-                    print(f"[cpn-renorm] reuse {stage} batch {batch_index + 1}", flush=True)
-                    return {name: stored[name] for name in stored.files
-                            if name != "batch_fingerprint"}
+                stored_key = str(stored["batch_fingerprint"].item())
+                if stored_key == key or stored_key in _legacy_batch_keys(
+                        cfg, geometry, stage, batch_index):
+                    result = {name: stored[name] for name in stored.files
+                              if name != "batch_fingerprint"}
+                    upgrade = stored_key != key
+                else:
+                    result = None
+            if result is not None:
+                print(f"[cpn-renorm] reuse {stage} batch {batch_index + 1}", flush=True)
+                if upgrade:
+                    atomic_npz(path, batch_fingerprint=np.asarray(key), **result)
+                return result
         except (KeyError, OSError, ValueError):
             pass
     print(f"[cpn-renorm] simulate {stage} batch {batch_index + 1}", flush=True)

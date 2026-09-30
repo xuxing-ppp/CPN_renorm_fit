@@ -19,6 +19,8 @@ DEFAULTS: dict[str, Any] = {
               "min_meas_total": 4800, "target_ess": 200,
               "max_meas_total": 19200},
     "geometry": {"boundary_bc": "OBC", "padding": -1, "coarse_L": -1,
+                 "padding_min": -1, "padding_max": -1,
+                 "coarse_L_min": -1, "coarse_L_max": -1,
                  "padding_xi_mul": 3.0, "obs_L_xi_mul": 10.0},
     "hmc": {"epsilon": 0.05, "trajectory_length": 1.0, "mass_a": 1.0,
             "mass_z": 1.0, "target_accept": 0.75, "adapt_steps": 200,
@@ -43,7 +45,8 @@ DEFAULTS: dict[str, Any] = {
                      "min_warmup": 400, "max_warmup": 4000,
                      "min_meas_per_boundary": 3000,
                      "target_ess_per_boundary": 500,
-                     "max_meas_per_boundary": 12000, "bins": 60},
+                     "max_meas_per_boundary": 12000, "bins": 60,
+                     "p0": {"U": [0.5, 0.5], "z": [0.5, 0.5]}},
         "observable": {"min_warmup": 500, "max_warmup": 6000,
                        "min_meas_total": 8000, "target_ess": 200,
                        "max_meas_total": 32000},
@@ -51,7 +54,8 @@ DEFAULTS: dict[str, Any] = {
                      "min_warmup": 400, "max_warmup": 4000,
                      "min_meas_per_boundary": 1000,
                      "target_ess_per_boundary": 500,
-                     "max_meas_per_boundary": 4000, "zero_pad": 1},
+                     "max_meas_per_boundary": 4000, "zero_pad": 1,
+                     "p0": {"U": 0.5, "z": 0.5}},
         "topo": {"min_warmup": 1000, "max_warmup": 12000,
                  "min_meas_total": 16000, "target_ess": 100,
                  "max_meas_total": 64000},
@@ -111,8 +115,15 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if float(model["alpha"]) < 0:
         raise ValueError("model.alpha must be non-negative for the full Villain action")
     ren = cfg["renormalization"]
-    if ren.get("type") not in ("U", "z") or int(ren.get("factor", 0)) < 1:
-        raise ValueError("renormalization.type must be U or z and factor positive")
+    renorm_types = ren.get("type")
+    if (not isinstance(renorm_types, list) or not renorm_types or
+            any(value not in ("U", "z") for value in renorm_types) or
+            len(set(renorm_types)) != len(renorm_types) or
+            int(ren.get("factor", 0)) < 1):
+        raise ValueError(
+            "renormalization.type must be a nonempty unique list containing U and/or z, "
+            "and factor must be positive")
+    ren["type"] = [name for name in ("z", "U") if name in renorm_types]
     if cfg["runtime"]["dtype"] not in ("float32", "float64"):
         raise ValueError("runtime.dtype must be float32 or float64")
     if "chains" in cfg["runtime"]:
@@ -200,12 +211,26 @@ def validate_config(cfg: dict[str, Any]) -> None:
         if float(settings["target_ess_per_boundary"]) > int(
                 settings["max_meas_per_boundary"]):
             raise ValueError(f"{prefix}.target_ess_per_boundary cannot exceed the sample cap")
+        p0 = settings.get("p0")
+        if not isinstance(p0, dict) or set(p0) != {"U", "z"}:
+            raise ValueError(f"{prefix}.p0 must provide exactly U and z initial values")
+        if name == "two_plaq":
+            if any(not isinstance(p0[tag], list) or len(p0[tag]) != 2
+                   for tag in ("U", "z")):
+                raise ValueError(f"{prefix}.p0 U/z values must be two-element arrays")
+        elif any(not isinstance(p0[tag], (int, float)) for tag in ("U", "z")):
+            raise ValueError(f"{prefix}.p0 U/z values must be numbers")
     geometry = cfg["geometry"]
     if int(geometry["padding"]) < -1 or (int(geometry["coarse_L"]) != -1 and
                                           int(geometry["coarse_L"]) < 2):
         raise ValueError("geometry.padding/coarse_L must be -1 or a valid override")
-    if geometry["boundary_bc"] == "PBC" and int(geometry["padding"]) == 0:
-        raise ValueError("geometry.padding must be -1 or at least 1 for PBC patches")
+    for stem, minimum in (("padding", 0), ("coarse_L", 2)):
+        lo, hi = int(geometry[f"{stem}_min"]), int(geometry[f"{stem}_max"])
+        if lo < -1 or hi < -1 or (lo != -1 and lo < minimum) or (
+                hi != -1 and hi < minimum):
+            raise ValueError(f"geometry.{stem}_min/max must be -1 or at least {minimum}")
+        if lo != -1 and hi != -1 and lo > hi:
+            raise ValueError(f"geometry.{stem}_min must not exceed {stem}_max")
     if geometry["padding_xi_mul"] <= 0 or geometry["obs_L_xi_mul"] <= 0:
         raise ValueError("geometry xi multipliers must be positive")
     hmc = cfg["hmc"]
@@ -221,10 +246,20 @@ def resolved_geometry(cfg: dict[str, Any], xi: float) -> dict[str, int | float]:
     factor = int(cfg["renormalization"]["factor"])
     requested_padding = int(cfg["geometry"]["padding"])
     requested_coarse = int(cfg["geometry"]["coarse_L"])
-    padding = (requested_padding if requested_padding >= 0 else
-               int(math.ceil(cfg["geometry"]["padding_xi_mul"] * xi)))
-    coarse = (requested_coarse if requested_coarse > 0 else
-              max(2, int(math.ceil(cfg["geometry"]["obs_L_xi_mul"] * xi / factor))))
+    def bounded(value: int, stem: str) -> int:
+        lower = int(cfg["geometry"][f"{stem}_min"])
+        upper = int(cfg["geometry"][f"{stem}_max"])
+        if lower != -1:
+            value = max(value, lower)
+        if upper != -1:
+            value = min(value, upper)
+        return value
+
+    padding = (requested_padding if requested_padding >= 0 else bounded(
+               int(math.ceil(cfg["geometry"]["padding_xi_mul"] * xi)), "padding"))
+    coarse = (requested_coarse if requested_coarse > 0 else bounded(
+              max(2, int(math.ceil(cfg["geometry"]["obs_L_xi_mul"] * xi / factor))),
+              "coarse_L"))
     fine = factor * coarse
     return {"xi": float(xi), "padding": padding, "L_fine": fine,
             "L_coarse": fine // factor, "factor": factor}

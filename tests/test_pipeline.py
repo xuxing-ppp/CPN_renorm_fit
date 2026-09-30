@@ -6,7 +6,8 @@ from unittest.mock import patch
 from cpn_renorm.config import load_config
 from cpn_renorm.pipeline import (_censored_xi_bracket, _dynamic_fit_spacing,
                                  _grid_significantly_brackets,
-                                 _remove_scan_ensembles, _run_beta1_scan, _run_topo,
+                                 _remove_scan_ensembles, _run_beta1_scan,
+                                 _run_one_plaq, _run_topo, _run_two_plaq,
                                  _scan_decision, _uniform_fit_grid, run_pipeline)
 import numpy as np
 from cpn_renorm.workspace import config_fingerprint
@@ -16,15 +17,64 @@ ROOT = Path(__file__).parents[1]
 
 
 class PipelineWorkspaceTests(unittest.TestCase):
+    @staticmethod
+    def _patch_raw() -> dict:
+        return {
+            "X_U": np.array([[1.0]]), "freq_U": np.array([0.4]),
+            "X_z": np.array([[2.0]]), "freq_z": np.array([0.5]),
+            "X_s": np.array([[3.0]]), "freq_s": np.array([0.6]),
+            "accept_rate": np.array([0.8]), "s_accept_rate": np.array([0.7]),
+            "requested_fit_times": 1, "effective_fit_times": 1,
+            "chains": 1, "batch_count": 1, "epsilon": np.array([0.05]),
+            "outer_warmup_sweeps": np.array([2]),
+            "outer_warmup_tau": np.array([[1.0]]),
+            "outer_warmup_stop_reason": np.array(["tau_stable"]),
+            "warmup_sweeps": np.array([0]), "warmup_tau": np.array([[1.0]]),
+            "warmup_stop_reason": np.array(["copied_equilibrium"]),
+            "inner_initialization": np.array(["copied_equilibrium"]),
+            "inner_adapt_steps": np.array([2]),
+            "sampling_minimum": 2, "sampling_actual": np.array([2]),
+            "sampling_total_actual": 2, "sampling_maximum": 4,
+            "sampling_target_ess": 1.0, "sampling_tau": np.array([[[0.5]]]),
+            "sampling_ess": np.array([[[2.0]]]),
+            "sampling_stop_reason": np.array(["target_ess_per_boundary"]),
+        }
+
+    def test_common_plaquette_stages_fit_both_definitions(self):
+        cfg = load_config(ROOT / "configs" / "example.toml")
+        cfg["runtime"]["device"] = "cpu"
+        cfg["model"]["alpha"] = 0.2
+        geometry = {"padding": 0, "L_fine": 8, "L_coarse": 2, "factor": 4}
+        raw = self._patch_raw()
+
+        def fake_fit(operation, _request, *, X, **_arrays):
+            marker = float(X[0, 0])
+            return ({"beta": marker, "alpha_eff": marker / 10}
+                    if operation == "two_plaq" else {"alpha": marker})
+
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder, patch(
+                "cpn_renorm.pipeline.generate_two_plaq", return_value=raw), patch(
+                "cpn_renorm.pipeline.generate_one_plaq", return_value=raw), patch(
+                "cpn_renorm.pipeline.isolated_fit", side_effect=fake_fit) as fit:
+            two = _run_two_plaq(cfg, Path(folder), geometry)
+            one = _run_one_plaq(cfg, Path(folder), geometry)
+        self.assertEqual(set(two["fits"]), {"U", "z"})
+        self.assertEqual(two["fits"]["U"]["beta"], 1.0)
+        self.assertEqual(two["fits"]["z"]["beta"], 2.0)
+        self.assertEqual(one["fits"]["U"]["alpha"], 3.0)
+        self.assertEqual(one["fits"]["z"]["alpha"], 2.0)
+        self.assertEqual(fit.call_count, 4)
+
     def test_pipeline_uses_stable_workspace_and_reports_config_fingerprint(self):
         cfg = load_config(ROOT / "configs" / "example.toml")
         cfg["runtime"]["device"] = "cpu"
         geometry = {"padding": 5, "L_fine": 28, "L_coarse": 7, "factor": 4}
         pilot = {"xi": 2.0, "xi_err": 0.1, "geometry": geometry}
-        step1 = {"beta": 0.6, "alpha_eff": 0.2}
+        step1 = {"fits": {"z": {"beta": 0.6, "alpha_eff": 0.2},
+                          "U": {"beta": 0.7, "alpha_eff": 0.25}}}
         match = {"value": 0.3, "bracketed": True}
         step2 = {"matches": {"magsus": match, "corr": match}}
-        step3 = {"alpha": 0.1}
+        step3 = {"fits": {"z": {"alpha": 0.1}, "U": {"alpha": None}}}
 
         with tempfile.TemporaryDirectory(dir=ROOT) as folder, patch(
                 "cpn_renorm.pipeline.run_pilot", return_value=pilot) as run_pilot, patch(
@@ -36,10 +86,40 @@ class PipelineWorkspaceTests(unittest.TestCase):
             self.assertEqual(run_pilot.call_args.args[1], expected)
             self.assertEqual(summary["run_id"], "example")
             self.assertEqual(summary["config_fingerprint"], config_fingerprint(cfg))
-            self.assertIn("beta = 0.6", summary["renorm_as_fine"]["magsus_1plaq"])
-            self.assertEqual(summary["fit_points"]["beta1"]["magsus"], [])
+            branch = summary["branches"]["z"]
+            self.assertIn("beta = 0.6", branch["renorm_as_fine"]["magsus_1plaq"])
+            self.assertEqual(branch["fit_points"]["beta1"]["magsus"], [])
             self.assertTrue((expected / "input.toml").exists())
             self.assertTrue((expected / "summary.json").exists())
+            self.assertTrue((expected / "branches" / "z" / "summary.json").exists())
+
+    def test_dual_type_pipeline_runs_common_stages_once_and_two_branches(self):
+        cfg = load_config(ROOT / "configs" / "example.toml")
+        cfg["runtime"]["device"] = "cpu"
+        cfg["renormalization"]["type"] = ["z", "U"]
+        cfg["model"]["alpha"] = 0.2
+        geometry = {"padding": 0, "L_fine": 8, "L_coarse": 2, "factor": 4}
+        pilot = {"xi": 1.0, "xi_err": 0.1, "geometry": geometry}
+        two = {"fits": {"z": {"beta": 0.6, "alpha_eff": 0.2},
+                        "U": {"beta": 0.7, "alpha_eff": 0.3}}}
+        one = {"fits": {"z": {"alpha": 0.1}, "U": {"alpha": 0.15}}}
+        match = {"value": 0.3, "error": 0.01, "bracketed": True}
+        scan = {"matches": {"magsus": match, "corr": match}}
+        topo = {"matches": {"magsus": match, "corr": match}}
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder, patch(
+                "cpn_renorm.pipeline.run_pilot", return_value=pilot), patch(
+                "cpn_renorm.pipeline._run_two_plaq", return_value=two) as run_two, patch(
+                "cpn_renorm.pipeline._run_one_plaq", return_value=one) as run_one, patch(
+                "cpn_renorm.pipeline._run_beta1_scan", return_value=scan) as run_beta, patch(
+                "cpn_renorm.pipeline._run_topo", return_value=topo) as run_topo:
+            summary = run_pipeline(cfg, Path(folder))
+        run_two.assert_called_once()
+        run_one.assert_called_once()
+        self.assertEqual(run_beta.call_count, 2)
+        self.assertEqual(run_topo.call_count, 2)
+        self.assertEqual(set(summary["branches"]), {"z", "U"})
+        branch_dirs = {call.args[1].name for call in run_beta.call_args_list}
+        self.assertEqual(branch_dirs, {"z", "U"})
 
     def test_undefined_xi_creates_censored_refinement_bracket(self):
         xs = np.array([-1.5, -0.7, -0.3])

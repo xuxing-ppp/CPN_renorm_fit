@@ -59,11 +59,13 @@ def affected_stages(changes: list[dict[str, Any]]) -> dict[str, str]:
     actions = {stage: "reuse" for stage in STAGES}
     for change in changes:
         path = change["path"]
-        if path.startswith(("model.", "renormalization.", "runtime.", "hmc.")):
+        if path == "renormalization.type":
+            _raise_action(actions, ("observable", "topology"), "resimulate")
+        elif path.startswith(("model.", "renormalization.", "runtime.", "hmc.")):
             _raise_action(actions, STAGES, "resimulate")
         elif path.startswith(("pilot.", "chains.pilot", "geometry.")):
             _raise_action(actions, STAGES, "resimulate")
-        elif path == "steps.two_plaq.p0":
+        elif path.startswith("steps.two_plaq.p0"):
             _raise_action(actions, ("two_plaq", "observable", "topology"),
                           "reprocess")
         elif path.startswith(("steps.two_plaq.", "chains.two_plaq")):
@@ -73,7 +75,7 @@ def affected_stages(changes: list[dict[str, Any]]) -> dict[str, str]:
             _raise_action(actions, ("observable", "topology"), "reprocess")
         elif path.startswith(("steps.observable.", "chains.observable")):
             _raise_action(actions, ("observable", "topology"), "resimulate")
-        elif path == "steps.one_plaq.p0":
+        elif path.startswith("steps.one_plaq.p0"):
             _raise_action(actions, ("one_plaq", "topology"), "reprocess")
         elif path.startswith(("steps.one_plaq.", "chains.one_plaq")):
             _raise_action(actions, ("one_plaq", "topology"), "resimulate")

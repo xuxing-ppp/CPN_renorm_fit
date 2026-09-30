@@ -7,7 +7,7 @@ alpha1 = 0.0
 mod = 1
 
 [renormalization]
-type = "z"
+type = ["z"]
 # Linear blocking factor; this is the patch L used by legacy 1plaq/2plaq fits.
 factor = 4
 
@@ -46,9 +46,14 @@ boundary_bc = "OBC"
 padding = -1
 # A value >= 2 fixes the observable coarse lattice; -1 derives it from obs_L_xi_mul.
 coarse_L = -1
+# Optional bounds for automatically derived values. -1 means unbounded.
+padding_min = -1
+padding_max = -1
+coarse_L_min = 20
+coarse_L_max = -1
 # These multipliers are consulted only when the corresponding override is -1.
 padding_xi_mul = 2.0
-obs_L_xi_mul = 10.0
+obs_L_xi_mul = 6.0
 
 [hmc]
 # epsilon is the initial/adaptation value. trajectory_length remains fixed while
@@ -121,7 +126,7 @@ min_meas_per_boundary = 3000
 target_ess_per_boundary = 600
 max_meas_per_boundary = 12000
 bins = 60
-p0 = [2.0, 0.0]
+p0 = { U = [2.0, 0.0], z = [2.0, 0.0] }
 
 [steps.observable]
 # Observable/topology stages do not use frozen boundaries; their measurement
@@ -141,7 +146,7 @@ min_meas_per_boundary = 1000
 target_ess_per_boundary = 200
 max_meas_per_boundary = 4000
 zero_pad = 1
-p0 = 1.0
+p0 = { U = 1.0, z = 1.0 }
 
 [steps.topo]
 min_warmup = 400

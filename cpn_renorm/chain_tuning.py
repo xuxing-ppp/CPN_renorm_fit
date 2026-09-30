@@ -141,8 +141,8 @@ def _workloads(cfg: dict, pilot: dict) -> dict[str, list[Workload]]:
                  settings_name="observable"),
     ]
 
-    skip_topo = (cfg["renormalization"]["type"] == "U"
-                 and abs(float(model["alpha"])) < 1e-12)
+    types = set(cfg["renormalization"]["type"])
+    skip_topo = (types == {"U"} and abs(float(model["alpha"])) < 1e-12)
     if not skip_topo:
         topo = section(cfg, "topo")
         topo_sweeps = _sampling_sweeps(topo)

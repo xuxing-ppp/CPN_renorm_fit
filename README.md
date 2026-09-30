@@ -45,6 +45,16 @@ All commands for a configuration named `example.toml` share the
 fit batch, and content-addressed ensemble. Pass `--force` to regenerate the
 work used by the current command.
 
+`renormalization.type` is a nonempty list such as `["z"]` or `["z", "U"]`.
+The two- and one-plaquette Monte Carlo batches measure all available connection
+or vortex definitions together and fit U/z separately, with type-specific
+`p0` values. The list controls which observable/topology branches are run under
+`runs/example/branches/<type>/`. Adding `"U"` later reuses the pilot and common
+plaquette batches and preserves the completed z branch. For `model.alpha = 0`,
+the U one-plaquette/topology result is explicitly unavailable because the fine
+integer `s` sector is unconstrained; the U two-plaquette and observable results
+remain available.
+
 The workspace records the last accepted effective configuration, including
 defaults and command-line device/seed overrides. If the configuration changes,
 the CLI prints every changed value and marks each pipeline stage as `reuse`,
@@ -97,9 +107,11 @@ used by the final inverse-variance-weighted monotonic polynomial. Explicit scan
 points select the initial samples; automatic expansion, localization, and final
 grid construction still follow.
 
-`summary.json` records the exact beta1/alpha points entering each final fit and
-stores `renorm_as_fine` entries as TOML assignment fragments that can replace
-the four coupling lines in an existing `[model]` section.
+The top-level `summary.json` indexes the common plaquette fits and requested
+branches. Each `branches/<type>/summary.json` records the exact beta1/alpha
+points entering that branch's final fit and stores `renorm_as_fine` entries as
+TOML assignment fragments that can replace the four coupling lines in an
+existing `[model]` section.
 
 For a server job, bind one process to one GPU and let the process batch its
 independent chains:
@@ -113,8 +125,13 @@ The pilot doubles its PBC lattice until
 `padding=ceil(padding_xi_mul*xi)` and rounds `L_fine` upward to a multiple of the
 renormalization factor, with `L_coarse >= 2`. Setting `geometry.padding` or
 `geometry.coarse_L` to a valid value overrides the corresponding derived size;
-`-1` selects automatic derivation. Scan ensembles are content-addressed and reused when an
-initial beta1/alpha interval must be expanded or the configured scan is edited.
+`-1` selects automatic derivation. Automatic values can be clamped with
+`padding_min/max` and `coarse_L_min/max`; a missing bound or `-1` means
+unbounded. Bounds do not constrain an explicit fixed value. PBC intentionally
+supports `padding = 0`: opposite sides are periodically identified, leaving two
+independent frozen boundaries. Scan ensembles are content-addressed and reused
+when an initial beta1/alpha interval must be expanded or the configured scan is
+edited.
 
 Recovery is stage-granular: a completed fit batch or scan point is reusable,
 but an interrupted in-progress HMC batch/point restarts from the beginning.

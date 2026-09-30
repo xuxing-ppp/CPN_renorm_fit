@@ -5,12 +5,11 @@ from pathlib import Path
 
 import torch
 
-from .config import resolved_geometry, section
+from .config import fingerprint, resolved_geometry, section
 from .observables import measure_ensemble
 from .progress import SimulationProgress, ensemble_summary
 from .sampler import BatchedHMCSampler, Couplings
 from .storage import atomic_json, atomic_npz, split_measurement
-from .config import fingerprint
 
 
 def resolve_device(name: str) -> torch.device:
@@ -44,20 +43,41 @@ def fine_sampler(cfg: dict, L: int, settings: dict, *, seed_offset: int = 0,
         mass_z=float(settings["mass_z"]))
 
 
+def _pilot_fingerprint(cfg: dict, *, schema: int = 5) -> str:
+    return fingerprint({"model": cfg["model"],
+                        "renormalization": {"factor": cfg["renormalization"]["factor"]},
+                        "runtime": cfg["runtime"], "pilot": cfg["pilot"],
+                        "hmc": cfg["hmc"], "chains": cfg["chains"]["pilot"],
+                        "geometry": cfg["geometry"], "schema": schema})
+
+
+def _legacy_pilot_fingerprints(cfg: dict) -> set[str]:
+    geometry = dict(cfg["geometry"])
+    for key in ("padding_min", "padding_max", "coarse_L_min", "coarse_L_max"):
+        geometry.pop(key, None)
+    return {fingerprint({"model": cfg["model"],
+                         "renormalization": {"type": kind,
+                                             "factor": cfg["renormalization"]["factor"]},
+                         "runtime": cfg["runtime"], "pilot": cfg["pilot"],
+                         "hmc": cfg["hmc"], "chains": cfg["chains"]["pilot"],
+                         "geometry": geometry, "schema": 4})
+            for kind in ("U", "z")}
+
+
 def run_pilot(cfg: dict, run_dir: str | Path) -> dict:
     p = cfg["pilot"]
     settings = section(cfg, "pilot")
     L, attempts = int(p["initial_L"]), []
     run_dir = Path(run_dir)
     result_path = run_dir / "pilot" / "result.json"
-    pilot_key = fingerprint({"model": cfg["model"], "renormalization": cfg["renormalization"],
-                             "runtime": cfg["runtime"], "pilot": p, "hmc": cfg["hmc"],
-                             "chains": cfg["chains"]["pilot"],
-                             "geometry": cfg["geometry"], "schema": 4})
+    pilot_key = _pilot_fingerprint(cfg)
     if result_path.exists() and not cfg.get("_force"):
         existing = __import__("json").loads(result_path.read_text(encoding="utf-8"))
-        if existing.get("fingerprint") == pilot_key:
+        if (existing.get("fingerprint") == pilot_key or
+                existing.get("fingerprint") in _legacy_pilot_fingerprints(cfg)):
+            existing["fingerprint"] = pilot_key
             existing["cache"] = "reused"
+            atomic_json(result_path, existing)
             return existing
     while True:
         failure = None

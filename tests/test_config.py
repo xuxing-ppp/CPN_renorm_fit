@@ -22,6 +22,38 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(geo["padding"], 5)
         self.assertEqual(geo["L_coarse"], 6)
 
+    def test_geometry_automatic_values_are_clamped_but_fixed_values_win(self):
+        cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
+        cfg["geometry"].update({"padding": -1, "padding_min": 7,
+                                "padding_max": 9, "coarse_L": -1,
+                                "coarse_L_min": 8, "coarse_L_max": 10})
+        geo = resolved_geometry(cfg, 2.01)
+        self.assertEqual(geo["padding"], 7)
+        self.assertEqual(geo["L_coarse"], 8)
+        cfg["geometry"].update({"padding": 2, "coarse_L": 20})
+        geo = resolved_geometry(cfg, 2.01)
+        self.assertEqual(geo["padding"], 2)
+        self.assertEqual(geo["L_coarse"], 20)
+
+    def test_renormalization_type_requires_a_unique_list(self):
+        cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
+        cfg["renormalization"]["type"] = "z"
+        with self.assertRaisesRegex(ValueError, "nonempty unique list"):
+            validate_config(cfg)
+        cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
+        cfg["renormalization"]["type"] = ["U", "z"]
+        validate_config(cfg)
+        self.assertEqual(cfg["renormalization"]["type"], ["z", "U"])
+
+    def test_geometry_bounds_are_strict_and_pbc_allows_zero_padding(self):
+        cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
+        cfg["geometry"].update({"boundary_bc": "PBC", "padding": 0,
+                                "padding_min": 0, "padding_max": 0})
+        validate_config(cfg)
+        cfg["geometry"].update({"padding_min": 3, "padding_max": 2})
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            validate_config(cfg)
+
     def test_patch_fit_counts_match_reference(self):
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
         self.assertEqual(cfg["steps"]["two_plaq"]["fit_times"], 5000)

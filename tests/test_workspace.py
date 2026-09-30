@@ -32,6 +32,15 @@ class WorkspaceTests(unittest.TestCase):
             "topology": "reprocess",
         })
 
+    def test_adding_renormalization_type_reuses_common_stages(self):
+        changes = [{"path": "renormalization.type", "old": ["z"],
+                    "new": ["z", "U"]}]
+        self.assertEqual(affected_stages(changes), {
+            "pilot": "reuse", "two_plaq": "reuse",
+            "observable": "resimulate", "one_plaq": "reuse",
+            "topology": "resimulate",
+        })
+
     def test_stage_settings_invalidate_only_dependents(self):
         changes = [{"path": "steps.one_plaq.max_warmup", "old": 10, "new": 20}]
         actions = affected_stages(changes)
