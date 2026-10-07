@@ -1,10 +1,11 @@
 [model]
+# Request [0, 1] to run both mod branches; beta1=0 shares the plaquette fits.
 N = 2
 beta = 1.0
 beta1 = 0.0
 alpha = 0.0
 alpha1 = 0.0
-mod = 1
+mod = [1]
 
 [renormalization]
 type = ["z"]
@@ -12,18 +13,22 @@ type = ["z"]
 factor = 4
 
 [runtime]
+# true tunes all stage widths before sampling; false uses the [chains] values.
+auto_chains = true
 device = "cuda"
 dtype = "float64"
 # All batch seeds are deterministic offsets from this seed, so resumed runs reproduce data.
 seed = 1018
 
 [chains]
-# GPU batch widths by pipeline stage. Paste tune-chains suggestions here.
+# Manual batch widths, also used as search seeds when auto_chains=true.
 pilot = 32
 two_plaq = 2048
-observable = 128
+observable_fine = 128
+observable_coarse = 128
 one_plaq = 2048
-topo = 256
+topo_fine = 256
+topo_coarse = 256
 
 [pilot]
 # Pilot chains are independent PBC replicas used only to estimate xi.
@@ -80,8 +85,8 @@ strict = false
 
 [scan.beta1]
 # Explicit points are simulated first; min/max bound any automatic bracket expansion.
-min = -8.0
-max = 8.0
+min = -16.0
+max = 4.0
 points = []
 growth_factor = 2.0
 max_rounds = 7
@@ -98,7 +103,7 @@ max_fit_grid_rounds = 3
 
 [scan.alpha]
 min = 0.001
-max = 8.0
+max = 4.0
 points = []
 growth_factor = 2.0
 max_rounds = 7

@@ -73,19 +73,21 @@ class ChainTuningTests(unittest.TestCase):
                           stages["two_plaq"][0].Ly), (15, 11))
         self.assertTrue(stages["two_plaq"][0].batched_ensembles)
         self.assertEqual(stages["two_plaq"][0].ensembles, 5000)
-        self.assertEqual(stages["observable"][0].Lx, 16)
-        self.assertIn("topo", stages)
+        self.assertEqual(stages["observable_fine"][0].Lx, 16)
+        self.assertIn("topo_fine", stages)
+        self.assertEqual(stages["observable_coarse"][0].Lx, 4)
+        self.assertEqual(stages["topo_coarse"][0].Lx, 4)
 
     def test_toml_suggestion_contains_only_available_recommendations(self):
         report = {"stages": {
             "pilot": {"recommended_chains": 8},
-            "observable": {"recommended_chains": 16},
-            "topo": {"recommended_chains": None},
+            "observable_fine": {"recommended_chains": 16},
+            "topo_fine": {"recommended_chains": None},
         }}
         suggestion = _toml_suggestion(report)
         self.assertIn("[chains]\npilot = 8", suggestion)
-        self.assertIn("observable = 16", suggestion)
-        self.assertNotIn("topo =", suggestion)
+        self.assertIn("observable_fine = 16", suggestion)
+        self.assertNotIn("topo_fine =", suggestion)
 
     def test_benchmark_reports_each_workload_to_progress(self):
         class RecordingProgress:

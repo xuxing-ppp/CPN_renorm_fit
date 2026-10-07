@@ -24,8 +24,15 @@ python -m cpn_renorm run configs/example.toml --output-dir runs
 python -m cpn_renorm run configs/example.toml --output-dir runs --skip-topo
 ```
 
-Tune the number of batched chains for the actual pilot-derived geometry before
-a production run:
+Set `[runtime] auto_chains = true` to tune batch widths automatically during
+`run` (including the pilot before sampling each lattice size). With `false`,
+the pipeline uses the seven `[chains]` values: `pilot`, `two_plaq`, `one_plaq`,
+`observable_fine`, `observable_coarse`, `topo_fine`, and `topo_coarse`.
+Fine and coarse widths are selected independently. The terminal prints each
+selection; `chain_tuning.json` stores the search and `resolved.json` and
+`summary.json` record the widths actually used by each branch.
+
+To benchmark independently:
 
 ```bash
 python -m cpn_renorm tune-chains configs/example.toml --output-dir runs
@@ -36,7 +43,7 @@ one-plaquette and topology workloads separately, and writes
 `runs/example/chain_tuning.json`. It prints a TOML snippet but never modifies
 the input configuration. The recommendation is the smallest safe chain count
 within 90% of the best measured throughput; by default a candidate may use at
-most 80% of CUDA memory and an estimated 4 GiB of host measurement memory.
+most 80% of CUDA memory and an estimated 8 GiB of host measurement memory.
 Adjust those limits with `--gpu-memory-fraction`, `--max-host-memory-gb`, and
 `--max-chains`.
 
@@ -49,11 +56,19 @@ work used by the current command.
 The two- and one-plaquette Monte Carlo batches measure all available connection
 or vortex definitions together and fit U/z separately, with type-specific
 `p0` values. The list controls which observable/topology branches are run under
-`runs/example/branches/<type>/`. Adding `"U"` later reuses the pilot and common
+`runs/example/branches/<type>_mod<mod>/`. `model.mod` is a unique, nonempty
+array such as `[1]` or `[0, 1]`; scalar mod and the old unsplit chains fields
+are rejected. At fine `beta1 = 0`, all mods share the pilot and plaquette
+results. At nonzero `beta1`, each mod has its own pilot geometry and common
+stages under `common/mod<mod>/`. Adding `"U"` later reuses the pilot and common
 plaquette batches and preserves the completed z branch. For `model.alpha = 0`,
 the U one-plaquette/topology result is explicitly unavailable because the fine
 integer `s` sector is unconstrained; the U two-plaquette and observable results
 remain available.
+
+Fitted beta and effective alpha retain full floating-point precision in
+subsequent scans and exported TOML. Branch summaries include all direct fit
+errors; these do not include propagation of upstream uncertainties.
 
 The workspace records the last accepted effective configuration, including
 defaults and command-line device/seed overrides. If the configuration changes,

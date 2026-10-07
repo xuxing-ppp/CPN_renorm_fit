@@ -3,7 +3,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cpn_renorm.config import load_config
+from cpn_renorm.config import load_config as _load_config
+
+
+def load_config(path):
+    cfg = _load_config(path)
+    cfg["runtime"]["auto_chains"] = False
+    return cfg
 from cpn_renorm.pipeline import (_censored_xi_bracket, _dynamic_fit_spacing,
                                  _grid_significantly_brackets,
                                  _remove_scan_ensembles, _run_beta1_scan,
@@ -86,12 +92,12 @@ class PipelineWorkspaceTests(unittest.TestCase):
             self.assertEqual(run_pilot.call_args.args[1], expected)
             self.assertEqual(summary["run_id"], "example")
             self.assertEqual(summary["config_fingerprint"], config_fingerprint(cfg))
-            branch = summary["branches"]["z"]
+            branch = summary["branches"]["z_mod1"]
             self.assertIn("beta = 0.6", branch["renorm_as_fine"]["magsus_1plaq"])
             self.assertEqual(branch["fit_points"]["beta1"]["magsus"], [])
             self.assertTrue((expected / "input.toml").exists())
             self.assertTrue((expected / "summary.json").exists())
-            self.assertTrue((expected / "branches" / "z" / "summary.json").exists())
+            self.assertTrue((expected / "branches" / "z_mod1" / "summary.json").exists())
 
     def test_dual_type_pipeline_runs_common_stages_once_and_two_branches(self):
         cfg = load_config(ROOT / "configs" / "example.toml")
@@ -117,9 +123,9 @@ class PipelineWorkspaceTests(unittest.TestCase):
         run_one.assert_called_once()
         self.assertEqual(run_beta.call_count, 2)
         self.assertEqual(run_topo.call_count, 2)
-        self.assertEqual(set(summary["branches"]), {"z", "U"})
+        self.assertEqual(set(summary["branches"]), {"z_mod1", "U_mod1"})
         branch_dirs = {call.args[1].name for call in run_beta.call_args_list}
-        self.assertEqual(branch_dirs, {"z", "U"})
+        self.assertEqual(branch_dirs, {"z_mod1", "U_mod1"})
 
     def test_undefined_xi_creates_censored_refinement_bracket(self):
         xs = np.array([-1.5, -0.7, -0.3])

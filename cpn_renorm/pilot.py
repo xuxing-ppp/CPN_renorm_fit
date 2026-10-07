@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from .config import fingerprint, resolved_geometry, section
+from .config import fine_model_key, fingerprint, mod_config, resolved_geometry, section
 from .observables import measure_ensemble
 from .progress import SimulationProgress, ensemble_summary
 from .sampler import BatchedHMCSampler, Couplings
@@ -43,43 +43,56 @@ def fine_sampler(cfg: dict, L: int, settings: dict, *, seed_offset: int = 0,
         mass_z=float(settings["mass_z"]))
 
 
-def _pilot_fingerprint(cfg: dict, *, schema: int = 5) -> str:
-    return fingerprint({"model": cfg["model"],
+def _pilot_fingerprint(cfg: dict, *, schema: int = 6) -> str:
+    return fingerprint({"model": fine_model_key(cfg["model"]),
                         "renormalization": {"factor": cfg["renormalization"]["factor"]},
                         "runtime": cfg["runtime"], "pilot": cfg["pilot"],
                         "hmc": cfg["hmc"], "chains": cfg["chains"]["pilot"],
                         "geometry": cfg["geometry"], "schema": schema})
 
 
-def _legacy_pilot_fingerprints(cfg: dict) -> set[str]:
-    geometry = dict(cfg["geometry"])
-    for key in ("padding_min", "padding_max", "coarse_L_min", "coarse_L_max"):
-        geometry.pop(key, None)
-    return {fingerprint({"model": cfg["model"],
-                         "renormalization": {"type": kind,
-                                             "factor": cfg["renormalization"]["factor"]},
-                         "runtime": cfg["runtime"], "pilot": cfg["pilot"],
-                         "hmc": cfg["hmc"], "chains": cfg["chains"]["pilot"],
-                         "geometry": geometry, "schema": 4})
-            for kind in ("U", "z")}
 
 
 def run_pilot(cfg: dict, run_dir: str | Path) -> dict:
+    if isinstance(cfg["model"]["mod"], list):
+        mods = cfg["model"]["mod"]
+        if float(cfg["model"]["beta1"]) == 0 or len(mods) == 1:
+            scalar = mod_config(cfg, 0 if float(cfg["model"]["beta1"]) == 0 else mods[0])
+            scalar["_tuning_records"] = {}
+            result = run_pilot(scalar, run_dir)
+            if cfg["runtime"]["auto_chains"]:
+                atomic_json(Path(run_dir) / "chain_tuning.json", {
+                    "stages": scalar["_tuning_records"], "chains": {"pilot": scalar["chains"]["pilot"]}})
+            return result
+        results, records, chains = {}, {}, {}
+        for mod in mods:
+            scalar = mod_config(cfg, mod)
+            scalar["_tuning_records"] = records
+            scalar["_tuning_prefix"] = f"mod{mod}/"
+            results[str(mod)] = run_pilot(scalar, Path(run_dir) / "common" / f"mod{mod}")
+            chains[f"mod{mod}"] = scalar["chains"]["pilot"]
+        if cfg["runtime"]["auto_chains"]:
+            atomic_json(Path(run_dir) / "chain_tuning.json", {"stages": records, "chains": chains})
+        return {"mods": results}
     p = cfg["pilot"]
     settings = section(cfg, "pilot")
     L, attempts = int(p["initial_L"]), []
     run_dir = Path(run_dir)
     result_path = run_dir / "pilot" / "result.json"
     pilot_key = _pilot_fingerprint(cfg)
-    if result_path.exists() and not cfg.get("_force"):
+    if result_path.exists() and not cfg.get("_force") and not cfg["runtime"]["auto_chains"]:
         existing = __import__("json").loads(result_path.read_text(encoding="utf-8"))
-        if (existing.get("fingerprint") == pilot_key or
-                existing.get("fingerprint") in _legacy_pilot_fingerprints(cfg)):
+        if existing.get("fingerprint") == pilot_key:
             existing["fingerprint"] = pilot_key
             existing["cache"] = "reused"
             atomic_json(result_path, existing)
             return existing
     while True:
+        if cfg["runtime"]["auto_chains"]:
+            from .chain_tuning import tune_pilot
+            tune_pilot(cfg, L)
+            settings = section(cfg, "pilot")
+            pilot_key = _pilot_fingerprint(cfg)
         failure = None
         for retry in range(2):
             multiplier = 2 ** retry
@@ -114,10 +127,12 @@ def run_pilot(cfg: dict, run_dir: str | Path) -> dict:
         metadata, arrays = split_measurement(measured)
         atomic_npz(run_dir / "pilot" / f"L{L}.npz", **arrays)
         attempts.append({"L": L, "retry": retry, "valid": True,
+                         "chains": settings["chains"],
                          "xi": xi, "xi_err": xi_err,
                          "conservative_L_over_xi": ratio, **metadata})
         if ratio >= float(p["min_L_over_xi"]):
             result = {"xi": xi, "xi_err": xi_err, "attempts": attempts,
+                      "chains": settings["chains"],
                       "fingerprint": pilot_key, "cache": "generated",
                       "geometry": resolved_geometry(cfg, xi)}
             atomic_json(run_dir / "pilot" / "result.json", result)

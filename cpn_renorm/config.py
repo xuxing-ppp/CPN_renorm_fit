@@ -10,9 +10,11 @@ from typing import Any
 
 
 DEFAULTS: dict[str, Any] = {
-    "runtime": {"device": "auto", "dtype": "float64", "seed": 1729},
-    "chains": {"pilot": 16, "two_plaq": 32, "observable": 16,
-               "one_plaq": 32, "topo": 16},
+    "runtime": {"device": "auto", "dtype": "float64", "seed": 1729,
+                "auto_chains": False},
+    "chains": {"pilot": 16, "two_plaq": 32, "observable_fine": 16,
+               "observable_coarse": 16, "one_plaq": 32,
+               "topo_fine": 16, "topo_coarse": 16},
     "pilot": {"initial_L": 16, "max_L": 256,
               "min_L_over_xi": 8.0,
               "growth_factor": 2.0, "min_warmup": 300, "max_warmup": 4000,
@@ -110,8 +112,19 @@ def validate_config(cfg: dict[str, Any]) -> None:
     for key in ("N", "beta", "beta1", "alpha", "alpha1", "mod"):
         if key not in model:
             raise ValueError(f"model.{key} is required")
-    if int(model["N"]) <= 1 or int(model["mod"]) not in (0, 1):
-        raise ValueError("model.N must be > 1 and model.mod must be 0 or 1")
+    if int(model["N"]) <= 1:
+        raise ValueError("model.N must be > 1")
+    mods = model["mod"]
+    if (not isinstance(mods, list) or not mods or
+            any(type(value) is not int or value not in (0, 1) for value in mods) or
+            len(set(mods)) != len(mods)):
+        raise ValueError("model.mod must be a nonempty unique list containing 0 and/or 1")
+    model["mod"] = sorted(mods)
+    if type(cfg["runtime"]["auto_chains"]) is not bool:
+        raise ValueError("runtime.auto_chains must be a boolean")
+    for old in ("observable", "topo"):
+        if old in cfg["chains"]:
+            raise ValueError(f"chains.{old} is obsolete; use {old}_fine and {old}_coarse")
     if float(model["alpha"]) < 0:
         raise ValueError("model.alpha must be non-negative for the full Villain action")
     ren = cfg["renormalization"]
@@ -166,7 +179,7 @@ def validate_config(cfg: dict[str, Any]) -> None:
             raise ValueError(f"scan.{name} fit-grid settings are invalid")
     if cfg["scan"]["alpha"]["min"] < 0:
         raise ValueError("scan.alpha.min must be non-negative")
-    chain_names = ("pilot", "two_plaq", "observable", "one_plaq", "topo")
+    chain_names = tuple(DEFAULTS["chains"])
     for name in chain_names:
         if int(cfg["chains"].get(name, 0)) < 1:
             raise ValueError(f"chains.{name} must be positive")
@@ -271,9 +284,27 @@ def fingerprint(payload: dict[str, Any]) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()[:20]
 
 
-def section(cfg: dict[str, Any], step: str) -> dict[str, Any]:
+def section(cfg: dict[str, Any], step: str, lattice: str = "coarse") -> dict[str, Any]:
     """Return shared runtime/HMC settings plus one step's sampling budget."""
     local = cfg["pilot"] if step == "pilot" else cfg["steps"][step]
     settings = _merge(_merge(cfg["runtime"], cfg["hmc"]), local)
-    settings["chains"] = int(cfg["chains"][step])
+    key = f"{step}_{lattice}" if step in ("observable", "topo") else step
+    settings["chains"] = int(cfg["chains"][key])
     return settings
+
+
+def mod_config(cfg: dict[str, Any], mod: int) -> dict[str, Any]:
+    """Create an internal scalar-mod configuration for one physical branch."""
+    out = deepcopy(cfg)
+    out["model"]["mod"] = mod
+    return out
+
+
+def fine_model_key(model: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Canonicalize mod only when the fine action is independent of it."""
+    if model is None:
+        return None
+    out = dict(model)
+    if float(out.get("beta1", 0)) == 0:
+        out.pop("mod", None)
+    return out

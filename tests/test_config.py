@@ -10,7 +10,7 @@ class ConfigTests(unittest.TestCase):
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
         geo = resolved_geometry(cfg, 2.01)
         self.assertEqual(geo["padding"], 5)
-        self.assertEqual(geo["L_coarse"], 6)
+        self.assertEqual(geo["L_coarse"], 20)
         self.assertEqual(geo["L_fine"] % cfg["renormalization"]["factor"], 0)
         self.assertEqual(geo["L_coarse"] * geo["factor"], geo["L_fine"])
 
@@ -18,6 +18,8 @@ class ConfigTests(unittest.TestCase):
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
         cfg["geometry"]["padding"] = -1
         cfg["geometry"]["coarse_L"] = -1
+        cfg["geometry"]["coarse_L_min"] = -1
+        cfg["geometry"]["obs_L_xi_mul"] = 10.0
         geo = resolved_geometry(cfg, 2.01)
         self.assertEqual(geo["padding"], 5)
         self.assertEqual(geo["L_coarse"], 6)
@@ -92,13 +94,15 @@ class ConfigTests(unittest.TestCase):
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
         self.assertNotIn("chains", cfg["runtime"])
         self.assertEqual(cfg["chains"], {
-            "pilot": 32, "two_plaq": 2048, "observable": 128,
-            "one_plaq": 2048, "topo": 256,
+            "pilot": 32, "two_plaq": 2048, "observable_fine": 128,
+            "observable_coarse": 128, "one_plaq": 2048,
+            "topo_fine": 256, "topo_coarse": 256,
         })
         self.assertNotIn("chains", cfg["pilot"])
         for name, settings in cfg["steps"].items():
             self.assertNotIn("chains", settings)
-            self.assertEqual(section(cfg, name)["chains"], cfg["chains"][name])
+            key = f"{name}_coarse" if name in ("observable", "topo") else name
+            self.assertEqual(section(cfg, name)["chains"], cfg["chains"][key])
 
     def test_rejects_obsolete_runtime_chains(self):
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
@@ -110,7 +114,7 @@ class ConfigTests(unittest.TestCase):
     def test_rejects_nonpositive_stage_chains(self):
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
         bad = deepcopy(cfg)
-        bad["chains"]["topo"] = 0
+        bad["chains"]["topo_fine"] = 0
         with self.assertRaisesRegex(ValueError, "chains.topo"):
             validate_config(bad)
 

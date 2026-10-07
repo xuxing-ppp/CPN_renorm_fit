@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .config import fingerprint, section
+from .config import fine_model_key, fingerprint, section
 from .sampler import BatchedHMCSampler, Couplings
 from .pilot import resolve_device, torch_dtype
 from .observables import _z_link_phase, autocorr_time, automatic_warmup
@@ -15,7 +15,7 @@ from .progress import SimulationProgress
 from .storage import atomic_npz
 
 
-PATCH_CACHE_SCHEMA = 4
+PATCH_CACHE_SCHEMA = 5
 TWO_PLAQ_ALGORITHM_REVISION = 2
 
 
@@ -425,7 +425,7 @@ def _batch_key(cfg: dict, geometry: dict, stage: str, batch_index: int) -> str:
         "schema": PATCH_CACHE_SCHEMA,
         "stage": stage,
         "batch": batch_index,
-        "model": cfg.get("model"),
+        "model": fine_model_key(cfg.get("model")),
         "renormalization": {"factor": cfg.get("renormalization", {}).get("factor")},
         "runtime": cfg.get("runtime"),
         "hmc": cfg.get("hmc"),
@@ -439,30 +439,6 @@ def _batch_key(cfg: dict, geometry: dict, stage: str, batch_index: int) -> str:
     return fingerprint(payload)
 
 
-def _legacy_batch_keys(cfg: dict, geometry: dict, stage: str,
-                       batch_index: int) -> set[str]:
-    """Return schema-3 keys whose raw arrays are type-independent."""
-    step = dict(cfg.get("steps", {}).get(stage, {}))
-    step.pop("fit_times", None)
-    step.pop("p0", None)
-    old_geometry = dict(cfg.get("geometry", {}))
-    for suffix in ("padding_min", "padding_max", "coarse_L_min", "coarse_L_max"):
-        old_geometry.pop(suffix, None)
-    keys = set()
-    for renorm_type in ("U", "z"):
-        payload = {
-            "schema": 3, "stage": stage, "batch": batch_index,
-            "model": cfg.get("model"),
-            "renormalization": {"type": renorm_type,
-                                "factor": cfg.get("renormalization", {}).get("factor")},
-            "runtime": cfg.get("runtime"), "hmc": cfg.get("hmc"),
-            "geometry_config": old_geometry, "geometry": geometry,
-            "settings": step, "chains": cfg.get("chains", {}).get(stage),
-        }
-        if stage == "two_plaq":
-            payload["algorithm_revision"] = TWO_PLAQ_ALGORITHM_REVISION
-        keys.add(fingerprint(payload))
-    return keys
 
 
 def patch_result_key(cfg: dict, geometry: dict, stage: str) -> str:
@@ -511,20 +487,15 @@ def _load_or_generate_batch(cfg: dict, geometry: dict, *, stage: str,
     path = None if cache_dir is None else cache_dir / f"batch_{batch_index:05d}.npz"
     if path is not None and path.exists() and not cfg.get("_force"):
         try:
-            upgrade = False
             with np.load(path, allow_pickle=False) as stored:
                 stored_key = str(stored["batch_fingerprint"].item())
-                if stored_key == key or stored_key in _legacy_batch_keys(
-                        cfg, geometry, stage, batch_index):
+                if stored_key == key:
                     result = {name: stored[name] for name in stored.files
                               if name != "batch_fingerprint"}
-                    upgrade = stored_key != key
                 else:
                     result = None
             if result is not None:
                 print(f"[cpn-renorm] reuse {stage} batch {batch_index + 1}", flush=True)
-                if upgrade:
-                    atomic_npz(path, batch_fingerprint=np.asarray(key), **result)
                 return result
         except (KeyError, OSError, ValueError):
             pass

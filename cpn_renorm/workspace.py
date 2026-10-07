@@ -9,7 +9,7 @@ from .config import fingerprint
 from .storage import atomic_copy, atomic_json
 
 
-STATE_SCHEMA = 1
+STATE_SCHEMA = 2
 STAGES = ("pilot", "two_plaq", "observable", "one_plaq", "topology")
 ACTION_RANK = {"reuse": 0, "reprocess": 1, "resimulate": 2}
 
@@ -54,13 +54,16 @@ def _raise_action(actions: dict[str, str], stages: tuple[str, ...], action: str)
             actions[stage] = action
 
 
-def affected_stages(changes: list[dict[str, Any]]) -> dict[str, str]:
+def affected_stages(changes: list[dict[str, Any]], *, beta1: float | None = None) -> dict[str, str]:
     """Conservatively classify work invalidated by effective-config changes."""
     actions = {stage: "reuse" for stage in STAGES}
     for change in changes:
         path = change["path"]
         if path == "renormalization.type":
             _raise_action(actions, ("observable", "topology"), "resimulate")
+        elif path == "model.mod":
+            stages = ("observable", "topology") if beta1 == 0 else STAGES
+            _raise_action(actions, stages, "resimulate")
         elif path.startswith(("model.", "renormalization.", "runtime.", "hmc.")):
             _raise_action(actions, STAGES, "resimulate")
         elif path.startswith(("pilot.", "chains.pilot", "geometry.")):
@@ -120,8 +123,8 @@ def inspect_workspace(cfg: dict[str, Any], output_root: str | Path, *,
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"cannot read workspace state {state_path}") from exc
         if previous.get("schema") != STATE_SCHEMA:
-            raise RuntimeError(
-                f"unsupported workspace state schema in {state_path}")
+            # A fresh run uses the new cache/layout schema; old data stays on disk.
+            previous = {}
     current = effective_config(cfg)
     source = str(Path(cfg["_config_path"]).resolve())
     old_config = previous.get("config")
@@ -133,7 +136,7 @@ def inspect_workspace(cfg: dict[str, Any], output_root: str | Path, *,
         changes=changes,
         source_changed=bool(old_source and old_source != source),
         previous_source=str(old_source) if old_source else None,
-        actions=affected_stages(changes),
+        actions=affected_stages(changes, beta1=float(cfg["model"]["beta1"])),
     )
 
 

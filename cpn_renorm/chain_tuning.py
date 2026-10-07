@@ -4,13 +4,13 @@ import gc
 import math
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterator
 
 import torch
 
-from .config import section
+from .config import DEFAULTS, mod_config, section
 from .pilot import resolve_device, run_pilot, torch_dtype
 from .progress import SimulationProgress
 from .sampler import ActionKind, BatchedHMCSampler, Couplings
@@ -83,6 +83,8 @@ def _sampling_sweeps(settings: dict) -> int:
 
 
 def _workloads(cfg: dict, pilot: dict) -> dict[str, list[Workload]]:
+    if isinstance(cfg["model"]["mod"], list):
+        cfg = mod_config(cfg, cfg["model"]["mod"][0])
     model, geometry = cfg["model"], pilot["geometry"]
     factor, pad = int(geometry["factor"]), int(geometry["padding"])
     fine_L, coarse_L = int(geometry["L_fine"]), int(geometry["L_coarse"])
@@ -127,13 +129,18 @@ def _workloads(cfg: dict, pilot: dict) -> dict[str, list[Workload]]:
         ]
 
     observable = section(cfg, "observable")
+    beta_scan = cfg["scan"]["beta1"]
+    beta_samples = beta_scan.get("points") or [
+        x for x in (-0.1, 0.0, 0.1) if beta_scan["min"] <= x <= beta_scan["max"]]
+    coarse_beta1 = max(beta_samples or [beta_scan["min"], beta_scan["max"]], key=abs)
+    coarse_folded = replace(folded, beta1=float(coarse_beta1))
     beta_points = len(cfg["scan"]["beta1"].get("points", [])) or 3
     obs_sweeps = _sampling_sweeps(observable)
     stages["observable"] = [
         Workload("fine", fine_L, fine_L, True, "half", folded, obs_sweeps,
                  int(math.ceil(observable["max_meas_total"] / observable["chains"])), True,
                  int(observable["max_meas_total"]), settings_name="observable"),
-        Workload("coarse_scan", coarse_L, coarse_L, True, "half", folded,
+        Workload("coarse_scan", coarse_L, coarse_L, True, "half", coarse_folded,
                  obs_sweeps * beta_points,
                  int(math.ceil(observable["max_meas_total"] / observable["chains"]))
                  * beta_points, True,
@@ -148,7 +155,7 @@ def _workloads(cfg: dict, pilot: dict) -> dict[str, list[Workload]]:
         topo_sweeps = _sampling_sweeps(topo)
         alpha_points = len(cfg["scan"]["alpha"].get("points", [])) or 5
         coarse_alpha = max(float(cfg["scan"]["alpha"]["min"]), 1e-6)
-        coarse = Couplings(float(model["beta"]), float(model["beta1"]),
+        coarse = Couplings(float(model["beta"]), float(coarse_beta1),
                            coarse_alpha, 0.0, int(model["mod"]))
         stages["topo"] = [
             Workload("fine", fine_L, fine_L, True, base_kind, base, topo_sweeps,
@@ -161,6 +168,15 @@ def _workloads(cfg: dict, pilot: dict) -> dict[str, list[Workload]]:
                      int(topo["max_meas_total"]) * 2 * alpha_points,
                      2 * alpha_points, settings_name="topo"),
         ]
+    for stage in ("observable", "topo"):
+        if stage in stages:
+            fine, coarse = stages.pop(stage)
+            fine_settings = section(cfg, stage, "fine")
+            fine = replace(fine, projected_sweeps=_sampling_sweeps(fine_settings),
+                           n_meas=int(math.ceil(fine_settings["max_meas_total"] /
+                                                fine_settings["chains"])))
+            stages[f"{stage}_fine"] = [fine]
+            stages[f"{stage}_coarse"] = [coarse]
     return stages
 
 
@@ -511,54 +527,110 @@ def _tuning_summary(stage: str, result: dict) -> str:
             f"projected={seconds} gpu_peak={peak} stop={stop}")
 
 
-def run_chain_tuning(cfg: dict, output_dir: str | Path, *, max_chains: int = 65536,
-                     warmup_sweeps: int = 2, timed_sweeps: int = 5,
-                     gpu_memory_fraction: float = 0.8,
-                     max_host_memory_gib: float = 4.0) -> dict:
-    """Run/reuse the pilot and benchmark safe chain counts for each stage."""
-    if warmup_sweeps < 0 or timed_sweeps < 1:
-        raise ValueError("benchmark sweep counts are invalid")
-    if max_chains < 1:
-        raise ValueError("max_chains must be positive")
-    if not 0 < gpu_memory_fraction <= 1 or max_host_memory_gib <= 0:
-        raise ValueError("benchmark memory limits are invalid")
-    output_dir = Path(output_dir)
-    run_dir = output_dir / Path(cfg["_config_path"]).stem
-    pilot = run_pilot(cfg, run_dir)
-    stages = {}
-    device = resolve_device(cfg["runtime"]["device"])
-    with _cuda_allocator_limit(device, gpu_memory_fraction):
-        with SimulationProgress("tune-chains") as progress:
-            for name, workloads in _workloads(cfg, pilot).items():
-                progress.phase(name, 0, unit="test")
-                configured_chains = int(cfg["chains"][name])
-                stages[name] = _benchmark_stage(
-                    cfg, workloads, configured_chains, max_chains=max_chains,
-                    warmup_sweeps=warmup_sweeps, timed_sweeps=timed_sweeps,
-                    gpu_memory_fraction=gpu_memory_fraction,
-                    max_host_memory_gib=max_host_memory_gib,
-                    progress=progress)
-                progress.message(_tuning_summary(name, stages[name]))
-    report = {
-        "device": str(resolve_device(cfg["runtime"]["device"])),
-        "dtype": cfg["runtime"]["dtype"],
-        "geometry": pilot["geometry"],
-        "limits": {"max_chains": max_chains,
-                   "gpu_memory_fraction": gpu_memory_fraction,
-                   "max_host_memory_gib": max_host_memory_gib},
-        "stages": stages,
-    }
-    report["toml"] = _toml_suggestion(report)
-    atomic_json(run_dir / "chain_tuning.json", report)
-    return report
 
 
 def _toml_suggestion(report: dict) -> str:
     lines = ["[chains]"]
-    for stage in ("pilot", "two_plaq", "observable", "one_plaq", "topo"):
+    for stage in DEFAULTS["chains"]:
         if stage not in report["stages"]:
             continue
         value = report["stages"][stage]["recommended_chains"]
         if value is not None:
             lines.append(f"{stage} = {value}")
     return "\n".join(lines)
+
+
+def tune_stage(cfg: dict, stage: str, workloads: list[Workload], *,
+               label: str | None = None, **limits) -> int:
+    """Benchmark a stage and record the batch width actually selected."""
+    options = {"max_chains": 65536, "warmup_sweeps": 5, "timed_sweeps": 10,
+               "gpu_memory_fraction": 0.8, "max_host_memory_gib": 8.0,
+               **cfg.get("_tuning_limits", {}), **limits}
+    if options["max_chains"] < 1 or options["timed_sweeps"] < 1 or options["warmup_sweeps"] < 0:
+        raise ValueError("benchmark chain/sweep limits are invalid")
+    if not 0 < options["gpu_memory_fraction"] <= 1 or options["max_host_memory_gib"] <= 0:
+        raise ValueError("benchmark memory limits are invalid")
+    device = resolve_device(cfg["runtime"]["device"])
+    with _cuda_allocator_limit(device, options["gpu_memory_fraction"]):
+        with SimulationProgress(f"tune {label or stage}") as progress:
+            progress.phase(stage, 0, unit="test")
+            result = _benchmark_stage(cfg, workloads, int(cfg["chains"][stage]),
+                                      progress=progress, **options)
+    name = label or f"{cfg.get('_tuning_prefix', '')}{stage}"
+    result["lattices"] = [{"name": w.name, "Lx": w.Lx, "Ly": w.Ly,
+                            "kind": w.kind, "mod": w.couplings.mod} for w in workloads]
+    result["limits"] = options
+    cfg.setdefault("_tuning_records", {})[name] = result
+    value = result["recommended_chains"]
+    print(f"[cpn-renorm] {name}: chains={value}; lattices={result['lattices']}",
+          flush=True)
+    if value is None:
+        raise RuntimeError(f"no safe chains candidate for {name}")
+    cfg["chains"][stage] = int(value)
+    return int(value)
+
+
+def tune_pilot(cfg: dict, L: int) -> int:
+    settings = section(cfg, "pilot")
+    couplings, kind = _fine_action(cfg)
+    workload = Workload("pbc", L, L, True, kind, couplings,
+                        _sampling_sweeps(settings),
+                        n_meas=int(math.ceil(settings["max_meas_total"] / settings["chains"])),
+                        stores_correlations=True,
+                        measurement_total=int(settings["max_meas_total"]),
+                        settings_name="pilot")
+    return tune_stage(cfg, "pilot", [workload],
+                      label=f"{cfg.get('_tuning_prefix', '')}pilot_L{L}",
+                      **cfg.get("_tuning_limits", {}))
+
+
+def run_chain_tuning(cfg: dict, output_dir: str | Path, **limits) -> dict:
+    """Tune independent lattice widths for every requested mod."""
+    run_dir = Path(output_dir) / Path(cfg["_config_path"]).stem
+    reports = {}
+    shared_pilot = None
+    shared_chains = {}
+    records = {}
+    for mod in cfg["model"]["mod"]:
+        branch = mod_config(cfg, mod)
+        # The pilot must be tuned before it is sampled, including size growth.
+        branch["runtime"]["auto_chains"] = True
+        branch["_tuning_prefix"] = f"mod{mod}/"
+        branch["_tuning_records"] = records
+        branch["_tuning_limits"] = limits
+        independent = float(cfg["model"]["beta1"]) != 0
+        if independent or shared_pilot is None:
+            pilot_cfg = mod_config(branch, mod if independent else 0)
+            pilot_cfg["_tuning_records"] = records
+            pilot_cfg["_tuning_prefix"] = f"mod{mod}/" if independent else "common/"
+            pilot_dir = run_dir / "common" / f"mod{mod}" if independent else run_dir
+            pilot = run_pilot(pilot_cfg, pilot_dir)
+            branch["chains"]["pilot"] = pilot_cfg["chains"]["pilot"]
+            if not independent:
+                shared_pilot = pilot
+                shared_chains["pilot"] = branch["chains"]["pilot"]
+        else:
+            pilot = shared_pilot
+            branch["chains"].update(shared_chains)
+        for stage, workloads in _workloads(branch, pilot).items():
+            if stage == "pilot":
+                continue
+            if stage == "one_plaq" and (branch["renormalization"]["type"] == ["U"]
+                                        and abs(float(branch["model"]["alpha"])) < 1e-12):
+                continue
+            if not independent and stage in shared_chains:
+                continue
+            prefix = "common/" if not independent and stage in ("two_plaq", "one_plaq") else f"mod{mod}/"
+            tune_stage(branch, stage, workloads, label=f"{prefix}{stage}", **limits)
+            if not independent and stage in ("two_plaq", "one_plaq"):
+                shared_chains[stage] = branch["chains"][stage]
+        reports[f"mod{mod}"] = {"chains": branch["chains"],
+                                "geometry": pilot["geometry"]}
+        reports[f"mod{mod}"]["toml"] = "[chains]\n" + "\n".join(
+            f"{key} = {value}" for key, value in branch["chains"].items())
+    report = {"device": str(resolve_device(cfg["runtime"]["device"])),
+              "dtype": cfg["runtime"]["dtype"], "mods": reports, "stages": records,
+              "toml": "\n\n".join(f"# {name}\n{item['toml']}"
+                                     for name, item in reports.items())}
+    atomic_json(run_dir / "chain_tuning.json", report)
+    return report

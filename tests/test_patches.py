@@ -16,7 +16,6 @@ from cpn_renorm.patches import (
     _boundary_data,
     _extract_rectangle,
     _install_rectangle,
-    _legacy_batch_keys,
     _load_or_generate_batch,
     _restore_patch,
     _two_plaq_connections,
@@ -234,12 +233,12 @@ class PatchTests(unittest.TestCase):
         self.assertEqual(calls, [2])
         np.testing.assert_array_equal(first["value"], second["value"])
 
-    def test_batch_cache_upgrades_legacy_scalar_type_fingerprint(self):
+    def test_batch_cache_rejects_legacy_scalar_type_fingerprint(self):
         from cpn_renorm.config import load_config
 
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
         geometry = {"padding": 5, "L_fine": 28, "L_coarse": 7, "factor": 4}
-        legacy_key = next(iter(_legacy_batch_keys(cfg, geometry, "two_plaq", 0)))
+        legacy_key = "old-schema-fingerprint"
         with tempfile.TemporaryDirectory(dir=Path(__file__).parents[1]) as folder:
             path = Path(folder) / "batch_00000.npz"
             np.savez(path, batch_fingerprint=np.asarray(legacy_key),
@@ -247,11 +246,11 @@ class PatchTests(unittest.TestCase):
             result = _load_or_generate_batch(
                 cfg, geometry, stage="two_plaq", batch_index=0,
                 cache_dir=Path(folder),
-                generate=lambda *_args: self.fail("legacy batch was regenerated"))
+                generate=lambda *_args: {"value": np.array([8])})
             with np.load(path, allow_pickle=False) as upgraded:
                 self.assertEqual(str(upgraded["batch_fingerprint"].item()),
                                  _batch_key(cfg, geometry, "two_plaq", 0))
-        np.testing.assert_array_equal(result["value"], np.array([7]))
+        np.testing.assert_array_equal(result["value"], np.array([8]))
 
     def test_batch_fingerprint_ignores_runtime_metadata(self):
         base = {"runtime": {"seed": 1}, "_config_path": "first.toml", "_force": False}

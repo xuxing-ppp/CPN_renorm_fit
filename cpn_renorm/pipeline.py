@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import fingerprint, section
+from .config import fingerprint, mod_config, section
 from .fit_client import extend_scan, isolated_fit, isolated_match, isolated_plot
 from .observables import measure_ensemble
 from .patches import (PATCH_CACHE_SCHEMA, generate_one_plaq, generate_two_plaq,
@@ -65,7 +65,22 @@ def _apply_point_diagnostics(cfg: dict, tag: str, result: dict) -> None:
 def _measure_point(cfg: dict, run_dir: Path, settings: dict, *, tag: str, L: int,
                    beta: float, beta1: float, alpha: float, alpha1: float,
                    kind: str) -> dict:
-    payload = {"schema": 3, "tag": tag, "L": L, "beta": beta, "beta1": beta1,
+    stage = "topo" if tag.startswith("topo") else "observable"
+    lattice = "fine" if "_fine" in tag else "coarse"
+    settings = {**settings, "chains": cfg["chains"][f"{stage}_{lattice}"]}
+    key_name = f"{stage}_{lattice}"
+    if cfg["runtime"]["auto_chains"] and key_name not in cfg.setdefault("_tuned_measurements", set()):
+        from .chain_tuning import Workload, _sampling_sweeps, tune_stage
+        workload = Workload(tag, L, L, True, kind,
+                            Couplings(beta, beta1, alpha, alpha1, int(cfg["model"]["mod"])),
+                            _sampling_sweeps(settings),
+                            n_meas=int(math.ceil(settings["max_meas_total"] / settings["chains"])),
+                            stores_correlations=True,
+                            measurement_total=int(settings["max_meas_total"]),
+                            settings_name=stage)
+        settings["chains"] = tune_stage(cfg, key_name, [workload])
+        cfg["_tuned_measurements"].add(key_name)
+    payload = {"schema": 4, "tag": tag, "L": L, "beta": beta, "beta1": beta1,
                "alpha": alpha, "alpha1": alpha1, "kind": kind,
                "N": cfg["model"]["N"], "mod": cfg["model"]["mod"],
                "settings": settings, "runtime": cfg["runtime"]}
@@ -121,8 +136,9 @@ def _scan_points(scan: dict) -> list[float]:
 def _scan_fingerprint(kind: str, cfg: dict, geometry: dict, *, renorm_type: str,
                       **upstream: float) -> str:
     step = "observable" if kind == "beta1" else "topo"
-    return fingerprint({"schema": 2, "kind": kind, "geometry": geometry,
+    return fingerprint({"schema": 3, "kind": kind, "geometry": geometry,
                         "scan": cfg["scan"][kind], "settings": section(cfg, step),
+                        "fine_chains": cfg["chains"][f"{step}_fine"],
                         "model": cfg["model"],
                         "renormalization": {"factor": cfg["renormalization"]["factor"],
                                             "type": renorm_type},
@@ -437,7 +453,7 @@ def _run_beta1_scan(cfg: dict, run_dir: Path, geometry: dict,
     result_key = _scan_fingerprint("beta1", cfg, geometry, renorm_type=renorm_type,
                                    beta_c=beta_c,
                                    alpha_eff_c=alpha_eff_c)
-    if result_path.exists() and not cfg.get("_force"):
+    if result_path.exists() and not cfg.get("_force") and not cfg["runtime"]["auto_chains"]:
         cached = json.loads(result_path.read_text(encoding="utf-8"))
         if cached.get("fingerprint") == result_key:
             _log("reuse completed step 2 (observable beta1 scan)")
@@ -660,7 +676,7 @@ def _run_topo(cfg: dict, run_dir: Path, geometry: dict, beta_c: float,
         alpha_1plaq=alpha_1plaq,
         beta1_magsus=beta1_matches["magsus"].get("value"),
         beta1_corr=beta1_matches["corr"].get("value"))
-    if result_path.exists() and not cfg.get("_force"):
+    if result_path.exists() and not cfg.get("_force") and not cfg["runtime"]["auto_chains"]:
         cached = json.loads(result_path.read_text(encoding="utf-8"))
         if cached.get("fingerprint") == result_key:
             _log("reuse completed step 3b (topological alpha scans)")
@@ -775,7 +791,9 @@ def _run_topo(cfg: dict, run_dir: Path, geometry: dict, beta_c: float,
 
 def _branch_summary(cfg: dict, run_name: str, renorm_type: str, geometry: dict,
                     beta_c: float, alpha_eff_c: float, alpha_1: float | None,
-                    step2: dict, topo: dict) -> dict:
+                    step2: dict, topo: dict, *, fit2: dict | None = None,
+                    fit1: dict | None = None) -> dict:
+    fit2, fit1 = fit2 or {}, fit1 or {}
     beta1 = {k: (float(v["value"]) if v.get("value") is not None else None)
              for k, v in step2["matches"].items()}
     beta1_err = {k: (float(v["error"]) if v.get("error") is not None else None)
@@ -785,24 +803,26 @@ def _branch_summary(cfg: dict, run_name: str, renorm_type: str, geometry: dict,
     atop_err = {k: (float(v["error"]) if v.get("error") is not None else None)
                 for k, v in topo["matches"].items()}
 
-    def combo(bkey: str, alpha: float | None) -> dict:
+    def combo(bkey: str, alpha: float | None, alpha_err: float | None) -> dict:
         return {"beta_c": beta_c, "beta1_c": beta1[bkey], "alpha_c": alpha,
                 "alpha1_c": (float(alpha_eff_c - alpha) if alpha is not None else None),
-                "alpha_eff_c": alpha_eff_c}
+                "alpha_eff_c": alpha_eff_c, "beta_c_err": fit2.get("beta_err"),
+                "alpha_eff_c_err": fit2.get("alpha_eff_err"),
+                "beta1_c_err": beta1_err[bkey], "alpha_c_err": alpha_err}
 
-    combos = {"magsus_obs_fit_topo": combo("magsus", atop["magsus"]),
-              "corr_obs_fit_topo": combo("corr", atop["corr"]),
-              "magsus_1plaq": combo("magsus", alpha_1),
-              "corr_1plaq": combo("corr", alpha_1)}
+    combos = {"magsus_obs_fit_topo": combo("magsus", atop["magsus"], atop_err["magsus"]),
+              "corr_obs_fit_topo": combo("corr", atop["corr"], atop_err["corr"]),
+              "magsus_1plaq": combo("magsus", alpha_1, fit1.get("alpha_err")),
+              "corr_1plaq": combo("corr", alpha_1, fit1.get("alpha_err"))}
     def toml_fragment(values: dict) -> str | None:
         fields = (values["beta_c"], values["beta1_c"],
                   values["alpha_c"], values["alpha1_c"])
         if any(value is None for value in fields):
             return None
-        return (f"beta = {float(fields[0]):.12g}\n"
-                f"beta1 = {float(fields[1]):.12g}\n"
-                f"alpha = {float(fields[2]):.12g}\n"
-                f"alpha1 = {float(fields[3]):.12g}")
+        return (f"beta = {float(fields[0])!r}\n"
+                f"beta1 = {float(fields[1])!r}\n"
+                f"alpha = {float(fields[2])!r}\n"
+                f"alpha1 = {float(fields[3])!r}")
 
     def fit_design(match: dict) -> dict:
         preliminary = match.get("preliminary", {})
@@ -814,15 +834,22 @@ def _branch_summary(cfg: dict, run_name: str, renorm_type: str, geometry: dict,
                 "grid_validation": match.get("grid_validation"),
                 "reason": match.get("reason")}
 
-    summary = {"run_name": run_name, "run_id": f"{run_name}/{renorm_type}",
+    summary = {"run_name": run_name,
+               "run_id": f"{run_name}/{renorm_type}_mod{cfg['model']['mod']}",
                "renormalization_type": renorm_type,
+               "mod": cfg["model"]["mod"],
+               "chains": dict(cfg["chains"]),
+               "chains_source": "auto" if cfg["runtime"]["auto_chains"] else "toml",
                "config_fingerprint": config_fingerprint(cfg),
                "created_at": datetime.now().isoformat(timespec="seconds"),
                "device": str(resolve_device(cfg["runtime"]["device"])),
                "geometry": geometry,
                "renormalized_couplings": {"beta_c": beta_c, "alpha_eff_c": alpha_eff_c,
+                                            "beta_c_err": fit2.get("beta_err"),
+                                            "alpha_eff_c_err": fit2.get("alpha_eff_err"),
                                             "beta1_c": beta1, "beta1_c_err": beta1_err,
                                             "alpha_c_1plaq": alpha_1,
+                                            "alpha_c_1plaq_err": fit1.get("alpha_err"),
                                             "alpha_c_topo": atop,
                                             "alpha_c_topo_err": atop_err},
                "fit_points": {
@@ -841,30 +868,52 @@ def _branch_summary(cfg: dict, run_name: str, renorm_type: str, geometry: dict,
     return summary
 
 
-def run_pipeline(cfg: dict, output_root: str | Path, *, skip_topo: bool = False) -> dict:
+def _run_mod_pipeline(cfg: dict, output_root: str | Path, *, skip_topo: bool = False) -> dict:
     run_name = Path(cfg["_config_path"]).stem
     run_dir = workspace_dir(cfg, output_root)
     run_dir.mkdir(parents=True, exist_ok=True)
     atomic_copy(cfg["_config_path"], run_dir / "input.toml")
     _log(f"run {run_name} on {resolve_device(cfg['runtime']['device'])}")
-    pilot = run_pilot(cfg, run_dir)
+    common_dir = Path(cfg.get("_common_dir", run_dir))
+    shared = cfg["_shared_common"]
+    if shared:
+        pilot, two_plaq, one_plaq, common_chains = shared[0]
+        cfg["chains"].update(common_chains)
+    else:
+        common_cfg = mod_config(cfg, 0) if float(cfg["model"]["beta1"]) == 0 else cfg
+        common_cfg["_tuning_records"] = cfg["_tuning_records"]
+        pilot = run_pilot(common_cfg, common_dir)
+        geometry = pilot["geometry"]
+        if cfg["runtime"]["auto_chains"]:
+            from .chain_tuning import _workloads, tune_stage
+            workloads = _workloads(common_cfg, pilot)
+            tune_stage(common_cfg, "two_plaq", workloads["two_plaq"])
+            if "z" in _renorm_types(cfg) or abs(float(cfg["model"]["alpha"])) >= 1e-12:
+                tune_stage(common_cfg, "one_plaq", workloads["one_plaq"])
+        two_plaq = _run_two_plaq(common_cfg, common_dir, geometry)
+        need_one = "z" in _renorm_types(cfg) or abs(float(cfg["model"]["alpha"])) >= 1e-12
+        one_plaq = (_run_one_plaq(common_cfg, common_dir, geometry) if need_one else
+                    {"fits": {"U": {"alpha": None,
+                                      "reason": "fine s sector is unconstrained when model.alpha=0"}}})
+        common_chains = {key: common_cfg["chains"][key]
+                         for key in ("pilot", "two_plaq", "one_plaq")}
+        cfg["chains"].update(common_chains)
+        shared.append((pilot, two_plaq, one_plaq, common_chains))
     geometry = pilot["geometry"]
     _log(f"pilot xi={pilot['xi']:.6g}±{pilot['xi_err']:.2g}; "
          f"padding={geometry['padding']} Lf={geometry['L_fine']} Lc={geometry['L_coarse']}")
-    atomic_json(run_dir / "resolved.json", {"config": cfg, "pilot": pilot})
-
-    two_plaq = _run_two_plaq(cfg, run_dir, geometry)
     types = _renorm_types(cfg)
-    need_one_plaq = "z" in types or abs(float(cfg["model"]["alpha"])) >= 1e-12
-    one_plaq = (_run_one_plaq(cfg, run_dir, geometry) if need_one_plaq else
-                {"fits": {"U": {"alpha": None,
-                                  "reason": "fine s sector is unconstrained when model.alpha=0"}}})
     branches = {}
     for renorm_type in types:
-        branch_dir = run_dir / "branches" / renorm_type
+        branch_name = f"{renorm_type}_mod{cfg['model']['mod']}"
+        branch_dir = run_dir / "branches" / branch_name
+        cfg["_tuning_prefix"] = f"{branch_name}/"
+        cfg["_tuned_measurements"] = set()
         fit2 = two_plaq["fits"][renorm_type]
-        beta_c = round(float(fit2["beta"]), 3)
-        alpha_eff_c = round(float(fit2["alpha_eff"]), 3)
+        beta_c = float(fit2["beta"])
+        alpha_eff_c = float(fit2["alpha_eff"])
+        _log(f"{branch_name} beta_c={beta_c!r} err={fit2.get('beta_err')!r}; "
+             f"alpha_eff_c={alpha_eff_c!r} err={fit2.get('alpha_eff_err')!r}")
         step2 = _run_beta1_scan(cfg, branch_dir, geometry, beta_c, alpha_eff_c,
                                 renorm_type=renorm_type)
         _log(f"{renorm_type} beta1 matches: {step2['matches']}")
@@ -885,23 +934,68 @@ def run_pipeline(cfg: dict, output_root: str | Path, *, skip_topo: bool = False)
                              step2["matches"], float(alpha_1),
                              renorm_type=renorm_type)
         summary = _branch_summary(cfg, run_name, renorm_type, geometry,
-                                  beta_c, alpha_eff_c, alpha_1, step2, topo)
+                                  beta_c, alpha_eff_c, alpha_1, step2, topo,
+                                  fit2=fit2, fit1=fit1)
         cleanup = list(step2.get("_cleanup_folders", [])) + list(
             topo.get("_cleanup_folders", []))
         removed = _remove_scan_ensembles(branch_dir, cleanup)
         summary["cleanup"] = {"removed_unused_coarse_ensembles": removed,
                               "count": len(removed)}
         atomic_json(branch_dir / "summary.json", summary)
-        branches[renorm_type] = summary
+        branches[branch_name] = summary
 
     summary = {"run_name": run_name, "run_id": run_name,
                "config_fingerprint": config_fingerprint(cfg),
                "created_at": datetime.now().isoformat(timespec="seconds"),
                "device": str(resolve_device(cfg["runtime"]["device"])),
                "geometry": geometry, "types": types,
+               "pilot": pilot,
                "common_plaquette_fits": {"two_plaq": two_plaq["fits"],
                                           "one_plaq": one_plaq.get("fits", {})},
                "branches": branches}
-    atomic_json(run_dir / "summary.json", summary)
-    _log(f"done: {run_dir / 'summary.json'}")
     return summary
+
+
+def run_pipeline(cfg: dict, output_root: str | Path, *, skip_topo: bool = False) -> dict:
+    """Run type/mod branches, sharing mod-independent fine ensembles."""
+    run_dir = workspace_dir(cfg, output_root)
+    shared: list = []
+    records: dict = {}
+    results = {}
+    branches = {}
+    try:
+        for mod in cfg["model"]["mod"]:
+            branch_cfg = mod_config(cfg, mod)
+            independent = float(cfg["model"]["beta1"]) != 0
+            branch_cfg["_common_dir"] = str(run_dir / "common" / f"mod{mod}") if independent else str(run_dir)
+            branch_cfg["_shared_common"] = [] if independent else shared
+            branch_cfg["_tuning_records"] = records
+            branch_cfg["_tuning_prefix"] = f"common_mod{mod}/" if independent else "common/"
+            result = _run_mod_pipeline(branch_cfg, output_root, skip_topo=skip_topo)
+            results[f"mod{mod}"] = result
+            branches.update(result["branches"])
+        summary = {"run_name": Path(cfg["_config_path"]).stem,
+                   "run_id": Path(cfg["_config_path"]).stem,
+                   "created_at": datetime.now().isoformat(timespec="seconds"),
+                   "config_fingerprint": config_fingerprint(cfg),
+                   "device": str(resolve_device(cfg["runtime"]["device"])),
+                   "types": _renorm_types(cfg), "mods": cfg["model"]["mod"],
+                   "geometries": {name: item["geometry"] for name, item in results.items()},
+                   "chains_source": "auto" if cfg["runtime"]["auto_chains"] else "toml",
+                   "chains": {name: item["chains"] for name, item in branches.items()},
+                   "common_plaquette_fits": {name: item["common_plaquette_fits"]
+                                              for name, item in results.items()},
+                   "branches": branches}
+        atomic_json(run_dir / "resolved.json", {
+            "config": {key: value for key, value in cfg.items() if not key.startswith("_")},
+            "chains_source": summary["chains_source"], "chains": summary["chains"],
+            "pilots": {name: item["pilot"] for name, item in results.items()}})
+        atomic_json(run_dir / "summary.json", summary)
+        _log(f"done: {run_dir / 'summary.json'}")
+        return summary
+    finally:
+        if cfg["runtime"]["auto_chains"]:
+            atomic_json(run_dir / "chain_tuning.json", {
+                "device": str(resolve_device(cfg["runtime"]["device"])),
+                "dtype": cfg["runtime"]["dtype"], "stages": records,
+                "chains": {name: item["chains"] for name, item in branches.items()}})
