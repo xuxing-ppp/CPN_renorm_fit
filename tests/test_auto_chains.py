@@ -24,7 +24,7 @@ class AutoChainsTests(unittest.TestCase):
         return cfg
 
     def test_new_format_and_rejected_old_fields(self):
-        for filename in ("example.toml", "N2_L4_b1.0_mod1.toml"):
+        for filename in ("example.toml",):
             cfg = load_config(ROOT / "configs" / filename)
             self.assertEqual(cfg["model"]["mod"], [1])
             self.assertTrue(cfg["runtime"]["auto_chains"])
@@ -54,7 +54,7 @@ class AutoChainsTests(unittest.TestCase):
                 "cpn_renorm.pipeline._apply_point_diagnostics"), patch(
                 "cpn_renorm.pipeline.ensemble_summary", return_value="done"), patch(
                 "cpn_renorm.chain_tuning.tune_stage") as tune:
-            for tag in ("obs_fine", "obs_coarse", "topo_fine", "topo_coarse_corr"):
+            for tag in ("obs_fine", "obs_coarse", "topo_fine", "topo_coarse_corrG"):
                 stage = "topo" if tag.startswith("topo") else "observable"
                 _measure_point(cfg, Path(folder), section(cfg, stage), tag=tag,
                                L=4, beta=1.0, beta1=0.0, alpha=0.0,
@@ -83,14 +83,14 @@ class AutoChainsTests(unittest.TestCase):
                 "cpn_renorm.pipeline.ensemble_summary", return_value="done"), patch(
                 "cpn_renorm.chain_tuning._benchmark_stage", side_effect=benchmark) as tune:
             for tag in ("obs_fine", "obs_coarse", "topo_fine", "topo_coarse_magsus",
-                        "topo_coarse_corr"):
+                        "topo_coarse_corrG"):
                 stage = "topo" if tag.startswith("topo") else "observable"
                 _measure_point(cfg, Path(folder), section(cfg, stage), tag=tag,
                                L=4, beta=1.0, beta1=0.0, alpha=0.0,
                                alpha1=0.0, kind="half")
             self.assertEqual(tune.call_count, 4)
             self.assertEqual([call.args[1]["chains"] for call in sampler.call_args_list],
-                             [3, 7, 5, 9, 9])
+                             [3, 7, 5, 9])
             self.assertEqual(set(cfg["_tuning_records"]),
                              {f"z_mod1/{key}" for key in recommendation})
 
@@ -131,8 +131,8 @@ class AutoChainsTests(unittest.TestCase):
     def test_pilot_retunes_each_growing_size(self):
         cfg = mod_config(self.config(), 1)
         cfg["runtime"]["auto_chains"] = True
-        cfg["pilot"].update(initial_L=4, max_L=8, min_L_over_xi=3)
-        measurements = [{"xi": 2.0, "xi_err": 0.0}, {"xi": 1.0, "xi_err": 0.0}]
+        cfg["pilot"].update(initial_L=4, max_L=8, min_L_over_xi_G=3)
+        measurements = [{"xi_G": 2.0, "xi_G_err": 0.0}, {"xi_G": 1.0, "xi_G_err": 0.0}]
 
         def tune(config, size):
             config["chains"]["pilot"] = size
@@ -149,16 +149,17 @@ class AutoChainsTests(unittest.TestCase):
         self.assertEqual(result["chains"], 8)
         self.assertEqual([attempt["chains"] for attempt in result["attempts"]], [4, 8])
 
-    def test_auto_pipeline_persists_selected_chains_and_skips_topo(self):
+    def test_auto_pipeline_persists_selected_chains_without_topology(self):
         cfg = self.config()
+        cfg["renormalization"]["alpha_methods"] = ["1plaq"]
         cfg["runtime"]["auto_chains"] = True
         geometry = {"padding": 0, "factor": 4, "L_fine": 8, "L_coarse": 2}
-        pilot = {"xi": 1.0, "xi_err": 0.1, "geometry": geometry,
+        pilot = {"xi_G": 1.0, "xi_G_err": 0.1, "geometry": geometry,
                  "attempts": [{"L": 8, "valid": True}]}
         two = {"fits": {"z": {"beta": 0.6, "alpha_eff": 0.2}}}
         one = {"fits": {"z": {"alpha": 0.1}}}
         match = {"value": 0.3, "error": 0.01, "bracketed": True}
-        scan = {"matches": {"magsus": match, "corr": match}}
+        scan = {"matches": {"magsus": match, "corrG": match}}
 
         def benchmark(_cfg, workloads, configured, **kwargs):
             value = 11 if workloads[0].name == "outer_boundary" else 13
@@ -177,14 +178,14 @@ class AutoChainsTests(unittest.TestCase):
                 "cpn_renorm.pipeline._run_beta1_scan", side_effect=beta_scan), patch(
                 "cpn_renorm.chain_tuning._benchmark_stage", side_effect=benchmark), patch(
                 "cpn_renorm.pipeline._run_topo") as topo:
-            summary = run_pipeline(cfg, folder, skip_topo=True)
+            summary = run_pipeline(cfg, folder)
             report = json.loads((Path(folder) / "example/chain_tuning.json").read_text())
             resolved = json.loads((Path(folder) / "example/resolved.json").read_text())
         topo.assert_not_called()
-        self.assertEqual(summary["chains"]["z_mod1"]["two_plaq"], 11)
-        self.assertEqual(summary["chains"]["z_mod1"]["observable_fine"], 13)
-        self.assertEqual(summary["chains"], report["chains"])
-        self.assertEqual(summary["chains"], resolved["chains"])
+        self.assertEqual(resolved["chains"]["z_mod1"]["two_plaq"], 11)
+        self.assertEqual(resolved["chains"]["z_mod1"]["observable_fine"], 13)
+        self.assertNotIn("chains", summary)
+        self.assertNotIn("chains", report)
         self.assertFalse(any("topo" in key for key in report["stages"]))
 
     def test_type_mod_product_reuse_precision_and_errors(self):
@@ -194,14 +195,14 @@ class AutoChainsTests(unittest.TestCase):
                 cfg["model"].update(mod=[0, 1], beta1=beta1, alpha=0.2)
                 cfg["renormalization"]["type"] = ["z", "U"]
                 geometry = {"padding": 0, "factor": 4, "L_fine": 8, "L_coarse": 2}
-                pilot = {"xi": 1.0, "xi_err": 0.1, "geometry": geometry}
+                pilot = {"xi_G": 1.0, "xi_G_err": 0.1, "geometry": geometry}
                 fit2 = {"beta": 0.6123456789012345, "alpha_eff": 0.2123456789012345,
                         "beta_err": 0.02, "alpha_eff_err": 0.03}
                 two = {"fits": {name: fit2 for name in ("z", "U")}}
                 one = {"fits": {name: {"alpha": 0.1, "alpha_err": 0.04}
                                 for name in ("z", "U")}}
                 match = {"value": 0.3, "error": 0.01, "bracketed": True}
-                scan = {"matches": {"magsus": match, "corr": match}}
+                scan = {"matches": {"magsus": match, "corrG": match}}
                 with tempfile.TemporaryDirectory() as folder, patch(
                         "cpn_renorm.pipeline.run_pilot", return_value=pilot) as p, patch(
                         "cpn_renorm.pipeline._run_two_plaq", return_value=two) as t, patch(
@@ -220,15 +221,14 @@ class AutoChainsTests(unittest.TestCase):
                         self.assertEqual(call.args[3:5], (fit2["beta"], fit2["alpha_eff"]))
                     for name, result in summary["branches"].items():
                         path = Path(folder) / "example/branches" / name / "summary.json"
-                        self.assertEqual(json.loads(path.read_text())["mod"], result["mod"])
-                        couplings = result["renormalized_couplings"]
-                        self.assertEqual(couplings["beta_c_err"], 0.02)
-                        self.assertEqual(couplings["alpha_eff_c_err"], 0.03)
-                        self.assertEqual(couplings["alpha_c_1plaq_err"], 0.04)
-                        fragment = tomllib.loads(result["renorm_as_fine"]["magsus_1plaq"])
-                        self.assertEqual(fragment["beta"], fit2["beta"])
+                        self.assertFalse(path.exists())
+                        self.assertEqual(result["results"]["magsus_1plaq"]["errors"]["beta"], 0.02)
+                        self.assertEqual(result["results"]["magsus_1plaq"]["errors"]["alpha_eff"], 0.03)
+                        self.assertEqual(result["results"]["magsus_1plaq"]["errors"]["alpha"], 0.04)
+                        self.assertEqual(result["results"]["magsus_1plaq"]["couplings"]["beta"], fit2["beta"])
                     resolved = json.loads((Path(folder) / "example/resolved.json").read_text())
-                    self.assertEqual(resolved["chains"], summary["chains"])
+                    self.assertEqual(set(resolved["chains"]), set(summary["branches"]))
+
 
 
 if __name__ == "__main__":

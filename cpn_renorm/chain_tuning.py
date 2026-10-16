@@ -15,6 +15,7 @@ from .pilot import resolve_device, run_pilot, torch_dtype
 from .progress import SimulationProgress
 from .sampler import ActionKind, BatchedHMCSampler, Couplings
 from .storage import atomic_json
+from .workspace import workspace_dir
 
 
 SEARCH_GROWTH_FACTOR = 4
@@ -107,6 +108,8 @@ def _workloads(cfg: dict, pilot: dict) -> dict[str, list[Workload]]:
 
     for stage, width, height in (("two_plaq", 2 * factor, factor),
                                  ("one_plaq", factor, factor)):
+        if stage == "one_plaq" and "1plaq" not in cfg["renormalization"]["alpha_methods"]:
+            continue
         settings = section(cfg, stage)
         fit_times = int(settings["fit_times"])
         periodic = cfg["geometry"]["boundary_bc"] == "PBC"
@@ -149,11 +152,14 @@ def _workloads(cfg: dict, pilot: dict) -> dict[str, list[Workload]]:
     ]
 
     types = set(cfg["renormalization"]["type"])
-    skip_topo = (types == {"U"} and abs(float(model["alpha"])) < 1e-12)
-    if not skip_topo:
+    if not cfg["renormalization"]["beta1_methods"]:
+        stages.pop("observable", None)
+    topo_enabled = ("topo" in cfg["renormalization"]["alpha_methods"] and
+                    not (types == {"U"} and abs(float(model["alpha"])) < 1e-12))
+    if topo_enabled:
         topo = section(cfg, "topo")
         topo_sweeps = _sampling_sweeps(topo)
-        alpha_points = len(cfg["scan"]["alpha"].get("points", [])) or 5
+        alpha_points = len(cfg["scan"]["alpha"].get("points", [])) or 3
         coarse_alpha = max(float(cfg["scan"]["alpha"]["min"]), 1e-6)
         coarse = Couplings(float(model["beta"]), float(coarse_beta1),
                            coarse_alpha, 0.0, int(model["mod"]))
@@ -162,11 +168,11 @@ def _workloads(cfg: dict, pilot: dict) -> dict[str, list[Workload]]:
                      int(math.ceil(topo["max_meas_total"] / topo["chains"])), True,
                      int(topo["max_meas_total"]), settings_name="topo"),
             Workload("coarse_scans", coarse_L, coarse_L, True, "full", coarse,
-                     topo_sweeps * 2 * alpha_points,
+                     topo_sweeps * len(cfg["renormalization"]["beta1_methods"]) * alpha_points,
                      int(math.ceil(topo["max_meas_total"] / topo["chains"]))
-                     * 2 * alpha_points, True,
-                     int(topo["max_meas_total"]) * 2 * alpha_points,
-                     2 * alpha_points, settings_name="topo"),
+                     * len(cfg["renormalization"]["beta1_methods"]) * alpha_points, True,
+                     int(topo["max_meas_total"]) * len(cfg["renormalization"]["beta1_methods"]) * alpha_points,
+                     len(cfg["renormalization"]["beta1_methods"]) * alpha_points, settings_name="topo"),
         ]
     for stage in ("observable", "topo"):
         if stage in stages:
@@ -586,7 +592,7 @@ def tune_pilot(cfg: dict, L: int) -> int:
 
 def run_chain_tuning(cfg: dict, output_dir: str | Path, **limits) -> dict:
     """Tune independent lattice widths for every requested mod."""
-    run_dir = Path(output_dir) / Path(cfg["_config_path"]).stem
+    run_dir = workspace_dir(cfg, output_dir)
     reports = {}
     shared_pilot = None
     shared_chains = {}

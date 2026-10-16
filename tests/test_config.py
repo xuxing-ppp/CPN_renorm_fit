@@ -14,12 +14,21 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(geo["L_fine"] % cfg["renormalization"]["factor"], 0)
         self.assertEqual(geo["L_coarse"] * geo["factor"], geo["L_fine"])
 
-    def test_geometry_minus_one_uses_xi_rules(self):
+    def test_old_length_config_names_are_rejected(self):
+        for section_name, key in (("pilot", "min_L_over_xi"),
+                                  ("geometry", "padding_xi_mul"),
+                                  ("geometry", "obs_L_xi_mul")):
+            cfg = load_config(Path(__file__).parents[1] / "configs/example.toml")
+            cfg[section_name][key] = 1.
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "rename it to"):
+                validate_config(cfg)
+
+    def test_geometry_minus_one_uses_xi_G_rules(self):
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
         cfg["geometry"]["padding"] = -1
         cfg["geometry"]["coarse_L"] = -1
         cfg["geometry"]["coarse_L_min"] = -1
-        cfg["geometry"]["obs_L_xi_mul"] = 10.0
+        cfg["geometry"]["obs_L_xi_G_mul"] = 10.0
         geo = resolved_geometry(cfg, 2.01)
         self.assertEqual(geo["padding"], 5)
         self.assertEqual(geo["L_coarse"], 6)

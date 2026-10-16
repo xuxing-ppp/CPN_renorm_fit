@@ -7,11 +7,11 @@ import sys
 from pathlib import Path
 
 from .chain_tuning import run_chain_tuning
-from .config import load_config
+from .config import load_config, resolve_config_path
 from .pipeline import run_pipeline
 from .pilot import resolve_device, run_pilot
 from .workspace import (WorkspaceChange, format_workspace_change,
-                        inspect_workspace, write_workspace_state)
+                        inspect_workspace, workspace_dir, write_workspace_state)
 
 
 def _override(cfg: dict, args: argparse.Namespace) -> None:
@@ -26,14 +26,14 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("validate", "pilot", "run"):
         p = sub.add_parser(name)
-        p.add_argument("config", type=Path)
+        p.add_argument("config", type=Path,
+                       help="config path or filename to search under configs/")
         p.add_argument("--device")
         p.add_argument("--seed", type=int)
         p.add_argument("--output-dir", type=Path, default=Path("runs"))
         if name != "validate":
             p.add_argument("--accept-changes", action="store_true")
         if name == "run":
-            p.add_argument("--skip-topo", action="store_true")
             p.add_argument("--force", action="store_true",
                            help="regenerate cached ensembles and completed steps")
     batch = sub.add_parser("batch")
@@ -41,11 +41,11 @@ def _parser() -> argparse.ArgumentParser:
     batch.add_argument("--device")
     batch.add_argument("--seed", type=int)
     batch.add_argument("--output-dir", type=Path, default=Path("runs"))
-    batch.add_argument("--skip-topo", action="store_true")
     batch.add_argument("--force", action="store_true")
     batch.add_argument("--accept-changes", action="store_true")
     tune = sub.add_parser("tune-chains")
-    tune.add_argument("config", type=Path)
+    tune.add_argument("config", type=Path,
+                      help="config path or filename to search under configs/")
     tune.add_argument("--device")
     tune.add_argument("--seed", type=int)
     tune.add_argument("--output-dir", type=Path, default=Path("runs"))
@@ -115,8 +115,7 @@ def main(argv: list[str] | None = None) -> None:
             cfg = load_config(path)
             _override(cfg, args)
             cfg["_force"] = args.force
-            run_dir = (Path(args.output_dir).resolve() /
-                       Path(cfg["_config_path"]).stem)
+            run_dir = workspace_dir(cfg, args.output_dir)
             change = inspect_workspace(
                 cfg, args.output_dir, baseline=latest_by_workspace.get(run_dir))
             latest_by_workspace[run_dir] = change
@@ -126,9 +125,13 @@ def main(argv: list[str] | None = None) -> None:
         for path, cfg, change in prepared:
             _start_workspaces([change], args.command)
             print(f"[cpn-renorm] running {path}", flush=True)
-            run_pipeline(cfg, args.output_dir, skip_topo=args.skip_topo)
+            run_pipeline(cfg, args.output_dir)
             _complete_workspace(change, args.command)
         return
+    try:
+        args.config = resolve_config_path(args.config)
+    except (ValueError, FileNotFoundError) as exc:
+        raise SystemExit(str(exc)) from exc
     cfg = load_config(args.config)
     _override(cfg, args)
     cfg["_force"] = getattr(args, "force", False)
@@ -149,10 +152,10 @@ def main(argv: list[str] | None = None) -> None:
             warmup_sweeps=args.warmup_sweeps, timed_sweeps=args.timed_sweeps,
             gpu_memory_fraction=args.gpu_memory_fraction,
             max_host_memory_gib=args.max_host_memory_gb)
-        report_path = args.output_dir / args.config.stem / "chain_tuning.json"
+        report_path = change.run_dir / "chain_tuning.json"
         _print_tuning(result, report_path.resolve())
     else:
-        summary = run_pipeline(cfg, args.output_dir, skip_topo=args.skip_topo)
+        summary = run_pipeline(cfg, args.output_dir)
         print(json.dumps(summary, indent=2))
     _complete_workspace(change, args.command)
 

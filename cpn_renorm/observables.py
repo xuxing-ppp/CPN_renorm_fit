@@ -28,7 +28,7 @@ def connected_pp(sampler: BatchedHMCSampler) -> torch.Tensor:
     return torch.fft.ifftn(projector_structure(sampler), dim=(1, 2)).real
 
 
-def second_moment_xi_from_modes(modes: np.ndarray, L: int) -> np.ndarray:
+def second_moment_xi_G_from_modes(modes: np.ndarray, L: int) -> np.ndarray:
     """modes[..., :] = S(0,0), S(kmin,0), S(0,kmin)."""
     modes = np.asarray(modes, dtype=float)
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -39,7 +39,7 @@ def second_moment_xi_from_modes(modes: np.ndarray, L: int) -> np.ndarray:
 
 def corr_length(corr: np.ndarray) -> float:
     spec = np.fft.fftn(corr).real
-    return float(second_moment_xi_from_modes(
+    return float(second_moment_xi_G_from_modes(
         np.array([spec[0, 0], spec[1, 0], spec[0, 1]]), corr.shape[0]))
 
 
@@ -160,8 +160,8 @@ def gamma_method(values: np.ndarray, c: float = 5.0) -> dict[str, np.ndarray | f
             "gamma0": gamma0, "tau": tau, "ess": ess, "window": window}
 
 
-def second_moment_xi_jacobian(mean_modes: np.ndarray, L: int) -> np.ndarray:
-    """Analytic gradient of the direction-averaged second-moment xi."""
+def second_moment_xi_G_jacobian(mean_modes: np.ndarray, L: int) -> np.ndarray:
+    """Analytic gradient of the direction-averaged second-moment xi_G."""
     s0, sx, sy = np.asarray(mean_modes, dtype=float)
     scale = 0.25 / math.sin(math.pi / L)
     rx, ry = s0 / sx - 1.0, s0 / sy - 1.0
@@ -173,13 +173,13 @@ def second_moment_xi_jacobian(mean_modes: np.ndarray, L: int) -> np.ndarray:
                              -0.5 * s0 / (sy * sy * qy)])
 
 
-def xi_from_modes_gamma(modes: np.ndarray, L: int) -> tuple[float, float, dict]:
+def xi_G_from_modes_gamma(modes: np.ndarray, L: int) -> tuple[float, float, dict]:
     stats = gamma_method(modes)
     mean = np.asarray(stats["mean"])
-    xi = float(second_moment_xi_from_modes(mean, L))
-    jac = second_moment_xi_jacobian(mean, L)
+    xi_G = float(second_moment_xi_G_from_modes(mean, L))
+    jac = second_moment_xi_G_jacobian(mean, L)
     variance = float(jac @ np.asarray(stats["covariance"]) @ jac)
-    return xi, math.sqrt(max(variance, 0.0)), stats
+    return xi_G, math.sqrt(max(variance, 0.0)), stats
 
 
 def measurement_stop_reason(rounds: int, chains: int, min_meas_total: int,
@@ -338,7 +338,7 @@ def measure_ensemble(sampler: BatchedHMCSampler, *, min_warmup: int,
             break
     mode_arr = np.asarray(modes)
     mode_stats = gamma_method(mode_arr)
-    xi, xi_err, _ = xi_from_modes_gamma(mode_arr, sampler.Lx)
+    xi_G, xi_G_err, _ = xi_G_from_modes_gamma(mode_arr, sampler.Lx)
     total = rounds * sampler.chains
     corr_mean = corr_sum.sum(0) / total
     raw_var = np.maximum(corr_sumsq.sum(0) / total - corr_mean ** 2, 0.0)
@@ -366,7 +366,7 @@ def measure_ensemble(sampler: BatchedHMCSampler, *, min_warmup: int,
             loop_out[key][tag] = {"mean": float(mean[0]), "err": float(err[0])}
     return {
         "conn_PP_corr": corr_mean, "conn_PP_corr_err": corr_err,
-        "modes": mode_arr, "xi": xi, "xi_err": xi_err,
+        "modes": mode_arr, "xi_G": xi_G, "xi_G_err": xi_G_err,
         "magsus": float(corr_mean.sum()),
         "magsus_err": float(math.sqrt(np.asarray(mode_stats["covariance"])[0, 0])),
         "topology": topo_out,

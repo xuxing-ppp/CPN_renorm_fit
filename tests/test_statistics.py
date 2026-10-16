@@ -5,9 +5,9 @@ import numpy as np
 from cpn_renorm.observables import (
     gamma_method,
     measurement_stop_reason,
-    second_moment_xi_from_modes,
-    second_moment_xi_jacobian,
-    xi_from_modes_gamma,
+    second_moment_xi_G_from_modes,
+    second_moment_xi_G_jacobian,
+    xi_G_from_modes_gamma,
 )
 
 
@@ -36,26 +36,26 @@ class StatisticsTests(unittest.TestCase):
         self.assertGreater(stats["covariance"][0, 1], 0)
         self.assertTrue(np.all(stats["ess"] < draws.shape[0] * draws.shape[1]))
 
-    def test_xi_jacobian_matches_finite_difference_and_propagation(self):
+    def test_xi_G_jacobian_matches_finite_difference_and_propagation(self):
         modes = np.array([10.0, 2.0, 2.5])
-        analytic = second_moment_xi_jacobian(modes, 32)
+        analytic = second_moment_xi_G_jacobian(modes, 32)
         numeric = []
         for column in range(3):
             step = 1e-6 * modes[column]
             plus, minus = modes.copy(), modes.copy()
             plus[column] += step
             minus[column] -= step
-            numeric.append((second_moment_xi_from_modes(plus, 32)
-                            - second_moment_xi_from_modes(minus, 32)) / (2 * step))
+            numeric.append((second_moment_xi_G_from_modes(plus, 32)
+                            - second_moment_xi_G_from_modes(minus, 32)) / (2 * step))
         np.testing.assert_allclose(analytic, numeric, rtol=2e-7, atol=1e-9)
 
         rng = np.random.default_rng(4)
         series = rng.normal(modes, [0.1, 0.03, 0.04], size=(300, 3, 3))
-        xi, error, stats = xi_from_modes_gamma(series, 32)
-        series_jacobian = second_moment_xi_jacobian(stats["mean"], 32)
+        xi_G, error, stats = xi_G_from_modes_gamma(series, 32)
+        series_jacobian = second_moment_xi_G_jacobian(stats["mean"], 32)
         expected = series_jacobian @ stats["covariance"] @ series_jacobian
         self.assertAlmostEqual(error * error, expected, places=10)
-        self.assertGreater(xi, 0)
+        self.assertGreater(xi_G, 0)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,6 @@ from .progress import SimulationProgress
 from .storage import atomic_npz
 
 
-PATCH_CACHE_SCHEMA = 5
 TWO_PLAQ_ALGORITHM_REVISION = 2
 
 
@@ -422,7 +421,6 @@ def _batch_key(cfg: dict, geometry: dict, stage: str, batch_index: int) -> str:
     step.pop("fit_times", None)
     step.pop("p0", None)
     payload = {
-        "schema": PATCH_CACHE_SCHEMA,
         "stage": stage,
         "batch": batch_index,
         "model": fine_model_key(cfg.get("model")),
@@ -447,7 +445,6 @@ def patch_result_key(cfg: dict, geometry: dict, stage: str) -> str:
     count = patch_batch_count(int(settings["fit_times"]),
                               int(cfg["chains"][stage]))
     payload = {
-        "schema": PATCH_CACHE_SCHEMA,
         "stage": stage,
         "batches": [_batch_key(cfg, geometry, stage, index)
                     for index in range(count)],
@@ -504,7 +501,7 @@ def _load_or_generate_batch(cfg: dict, geometry: dict, *, stage: str,
     summary = _batch_summary(stage, batch_index, result)
     if summary is not None:
         print(f"[cpn-renorm] {summary}", flush=True)
-    if path is not None:
+    if path is not None and cfg.get("storage", {}).get("save_npz", False):
         atomic_npz(path, batch_fingerprint=np.asarray(key), **result)
     return result
 

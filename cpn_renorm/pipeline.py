@@ -4,21 +4,23 @@ import json
 import math
 import shutil
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
+from .cache import (load_point, point_identity, read_json,
+                    scan_measurements, store_point, write_scan_points)
 from .config import fingerprint, mod_config, section
 from .fit_client import extend_scan, isolated_fit, isolated_match, isolated_plot
+from .methods import BETA1_METHODS
 from .observables import measure_ensemble
-from .patches import (PATCH_CACHE_SCHEMA, generate_one_plaq, generate_two_plaq,
+from .patches import (generate_one_plaq, generate_two_plaq,
                       patch_result_key)
 from .pilot import resolve_device, run_pilot, torch_dtype
 from .progress import SimulationProgress, ensemble_summary
 from .sampler import BatchedHMCSampler, Couplings
-from .storage import atomic_copy, atomic_json, atomic_npz, split_measurement
-from .workspace import config_fingerprint, workspace_dir
+from .storage import atomic_copy, atomic_json, atomic_npz
+from .workspace import workspace_dir
 
 
 def _log(message: str) -> None:
@@ -43,10 +45,10 @@ def _point_sampler(cfg: dict, settings: dict, *, L: int, beta: float, beta1: flo
 
 
 def _apply_point_diagnostics(cfg: dict, tag: str, result: dict) -> None:
-    accept_mean = float(np.mean(result["accept_rate"]))
+    accept_mean = float(np.mean(result.get("accept_rate", np.nan)))
     diag_cfg = cfg["diagnostics"]
     warnings = []
-    if not diag_cfg["min_accept"] <= accept_mean <= diag_cfg["max_accept"]:
+    if math.isfinite(accept_mean) and not diag_cfg["min_accept"] <= accept_mean <= diag_cfg["max_accept"]:
         cause = ("integration error is likely too large"
                  if accept_mean < diag_cfg["min_accept"] else
                  "epsilon is likely too small and leapfrog cost excessive")
@@ -55,7 +57,7 @@ def _apply_point_diagnostics(cfg: dict, tag: str, result: dict) -> None:
     if result["sampling"]["stop_reason"] == "max_meas_total":
         warnings.append(
             "maximum measurements reached before every primary observable met target ESS")
-    if result["warmup"]["stop_reason"] == "max_warmup":
+    if result.get("warmup", {}).get("stop_reason") == "max_warmup":
         warnings.append("maximum warmup reached before autocorrelation times stabilized")
     result["diagnostics"] = {"valid": not warnings, "warnings": warnings}
     if warnings and diag_cfg.get("strict"):
@@ -69,6 +71,16 @@ def _measure_point(cfg: dict, run_dir: Path, settings: dict, *, tag: str, L: int
     lattice = "fine" if "_fine" in tag else "coarse"
     settings = {**settings, "chains": cfg["chains"][f"{stage}_{lattice}"]}
     key_name = f"{stage}_{lattice}"
+    requested = {"tag": tag, "L": L, "beta": beta, "beta1": beta1,
+                 "alpha": alpha, "alpha1": alpha1, "kind": kind,
+                 "N": cfg["model"]["N"], "mod": cfg["model"]["mod"],
+                 "settings": settings, "runtime": cfg["runtime"]}
+    requested_key, _, requested_context = point_identity(requested)
+    existing = run_dir / "ensembles" / f"{requested_context['tag']}_{requested_key}"
+    if (existing / "result.json").exists() and not cfg.get("_force"):
+        result = load_point(existing)
+        _apply_point_diagnostics(cfg, tag, result)
+        return result
     if cfg["runtime"]["auto_chains"] and key_name not in cfg.setdefault("_tuned_measurements", set()):
         from .chain_tuning import Workload, _sampling_sweeps, tune_stage
         workload = Workload(tag, L, L, True, kind,
@@ -80,19 +92,15 @@ def _measure_point(cfg: dict, run_dir: Path, settings: dict, *, tag: str, L: int
                             settings_name=stage)
         settings["chains"] = tune_stage(cfg, key_name, [workload])
         cfg["_tuned_measurements"].add(key_name)
-    payload = {"schema": 4, "tag": tag, "L": L, "beta": beta, "beta1": beta1,
+    payload = {"tag": tag, "L": L, "beta": beta, "beta1": beta1,
                "alpha": alpha, "alpha1": alpha1, "kind": kind,
                "N": cfg["model"]["N"], "mod": cfg["model"]["mod"],
                "settings": settings, "runtime": cfg["runtime"]}
-    key = fingerprint(payload)
-    folder = run_dir / "ensembles" / f"{tag}_{key}"
-    meta_file, data_file = folder / "result.json", folder / "data.npz"
-    if meta_file.exists() and data_file.exists() and not cfg.get("_force"):
-        meta = json.loads(meta_file.read_text(encoding="utf-8"))
-        with np.load(data_file) as data:
-            meta.update({name: data[name] for name in data.files})
-        meta["cache"] = "reused"
-        meta["_folder"] = str(folder)
+    key, _, context = point_identity(payload)
+    folder = run_dir / "ensembles" / f"{context['tag']}_{key}"
+    meta_file = folder / "result.json"
+    if meta_file.exists() and not cfg.get("_force"):
+        meta = load_point(folder)
         _apply_point_diagnostics(cfg, tag, meta)
         _log(f"reuse {tag}: L={L} beta1={beta1:.6g} alpha={alpha:.6g}")
         return meta
@@ -116,12 +124,9 @@ def _measure_point(cfg: dict, run_dir: Path, settings: dict, *, tag: str, L: int
             s_step=float(settings["s_step"]), s_updates=int(settings["s_updates"]),
             progress=progress)
     _apply_point_diagnostics(cfg, tag, result)
-    meta, arrays = split_measurement(result)
-    meta.update({"fingerprint": key, "parameters": payload, "cache": "generated"})
-    atomic_npz(data_file, **arrays)
-    atomic_json(meta_file, meta)
+    folder = store_point(cfg, run_dir, payload, result)
     _log(ensemble_summary(label, result))
-    result.update({"fingerprint": key, "cache": "generated", "_folder": str(folder)})
+    result.update({"cache": "generated", "_folder": str(folder)})
     return result
 
 
@@ -136,7 +141,7 @@ def _scan_points(scan: dict) -> list[float]:
 def _scan_fingerprint(kind: str, cfg: dict, geometry: dict, *, renorm_type: str,
                       **upstream: float) -> str:
     step = "observable" if kind == "beta1" else "topo"
-    return fingerprint({"schema": 3, "kind": kind, "geometry": geometry,
+    return fingerprint({"kind": kind, "geometry": geometry,
                         "scan": cfg["scan"][kind], "settings": section(cfg, step),
                         "fine_chains": cfg["chains"][f"{step}_fine"],
                         "model": cfg["model"],
@@ -170,9 +175,9 @@ def _remove_scan_ensembles(run_dir: Path, folders: list[str]) -> list[str]:
     return removed
 
 
-def _censored_xi_bracket(xs: np.ndarray, ys: np.ndarray,
+def _censored_xi_G_bracket(xs: np.ndarray, ys: np.ndarray,
                          target: float) -> list[float] | None:
-    """Bracket xi onset when an undefined lower point precedes xi > target."""
+    """Bracket xi_G onset when an undefined lower point precedes xi_G > target."""
     for high_idx, (x_high, y_high) in enumerate(zip(xs, ys)):
         if not np.isfinite(y_high) or y_high <= target:
             continue
@@ -217,7 +222,7 @@ def _scan_decision(match: dict, *, tolerance: float, max_refine: int,
     if bracket is None:
         return None, "unbracketed"
     width = float(bracket[1] - bracket[0])
-    # A censored xi bracket still lacks a finite point below the target. Keep
+    # A censored xi_G bracket still lacks a finite point below the target. Keep
     # bisecting it even below the ordinary localization tolerance.
     if match.get("bracketed") and width <= tolerance:
         return None, "tolerance"
@@ -353,8 +358,7 @@ def _run_two_plaq(cfg: dict, run_dir: Path, geometry: dict) -> dict:
     result_key = patch_result_key(cfg, geometry, "two_plaq")
     if result_path.exists() and not cfg.get("_force"):
         cached = json.loads(result_path.read_text(encoding="utf-8"))
-        if (cached.get("cache_schema") == PATCH_CACHE_SCHEMA and
-                cached.get("fingerprint") == result_key):
+        if cached.get("fingerprint") == result_key:
             _log("reuse completed step 1 (2plaq)")
             return cached
     _log("step 1/4: 2plaq fit")
@@ -365,7 +369,8 @@ def _run_two_plaq(cfg: dict, run_dir: Path, geometry: dict) -> dict:
         "two_plaq", {"N": int(cfg["model"]["N"]), "p0": p0[tag]},
         X=raw[f"X_{tag}"], freq=raw[f"freq_{tag}"])
         for tag in ("U", "z")}
-    atomic_npz(run_dir / "step1_2plaq" / "measurements.npz", **raw)
+    if cfg["storage"]["save_npz"]:
+        atomic_npz(run_dir / "step1_2plaq" / "measurements.npz", **raw)
     stop_reasons = np.asarray(raw["sampling_stop_reason"]).astype(str)
     warmup_reasons = np.asarray(raw["warmup_stop_reason"]).astype(str)
     outer_warmup_reasons = np.asarray(raw["outer_warmup_stop_reason"]).astype(str)
@@ -380,7 +385,7 @@ def _run_two_plaq(cfg: dict, run_dir: Path, geometry: dict) -> dict:
         warnings.append(f"HMC acceptance {patch_accept:.3f} outside configured range")
     if warnings and cfg["diagnostics"].get("strict"):
         raise RuntimeError("two_plaq diagnostics failed: " + "; ".join(warnings))
-    result = {"step": "2plaq", "cache_schema": PATCH_CACHE_SCHEMA,
+    result = {"step": "2plaq",
               "fingerprint": result_key, "fits": fits,
               "accept_rate": {"mean": float(np.mean(raw["accept_rate"])),
                               "std": float(np.std(raw["accept_rate"]))},
@@ -413,172 +418,159 @@ def _run_two_plaq(cfg: dict, run_dir: Path, geometry: dict) -> dict:
 
 def _plot_beta1_scan(run_dir: Path, scale_factor: int, fine: dict,
                      measured: dict[float, dict], matches: dict[str, dict]) -> None:
-    """Plot magnetic susceptibility and correlation length on separate axes."""
     xs = np.array(sorted(measured))
-    isolated_plot(
-        run_dir / "step2_observable" / "beta1_scan_magsus.png", x=xs,
-        series={"magsus_scaled": np.array([
-            measured[x]["magsus"] * scale_factor ** 2 for x in xs])},
-        errors={"magsus_scaled": np.array([
-            measured[x]["magsus_err"] * scale_factor ** 2 for x in xs])},
-        matches={"magsus_scaled": matches["magsus"]},
-        targets={"fine_magsus": fine["magsus"]},
-        colors={"magsus_scaled": "tab:blue", "fine_magsus": "tab:blue"},
-        xlabel="beta1", ylabel="scaled magnetic susceptibility")
-    isolated_plot(
-        run_dir / "step2_observable" / "beta1_scan_corr.png", x=xs,
-        series={"xi_scaled": np.array([
-            measured[x]["xi"] * scale_factor
-            if measured[x].get("xi") is not None else np.nan for x in xs])},
-        errors={"xi_scaled": np.array([
-            measured[x]["xi_err"] * scale_factor
-            if measured[x].get("xi_err") is not None else np.nan for x in xs])},
-        matches={"xi_scaled": matches["corr"]},
-        targets={"fine_xi": fine["xi"]},
-        colors={"xi_scaled": "tab:orange", "fine_xi": "tab:orange"},
-        xlabel="beta1", ylabel="scaled correlation length")
+    for method, field, scale in (("magsus", "magsus", scale_factor ** 2),
+                                  ("corrG", "xi_G", scale_factor)):
+        if method not in matches:
+            continue
+        label = "magsus_scaled" if method == "magsus" else "xi_G_scaled"
+        isolated_plot(run_dir / "step2_observable" / f"beta1_scan_{method}.png", x=xs,
+            series={label: np.array([float(measured[x][field]) * scale
+                if measured[x].get(field) is not None else np.nan for x in xs])},
+            errors={label: np.array([float(measured[x][field + "_err"]) * scale
+                if measured[x].get(field + "_err") is not None else np.nan for x in xs])},
+            matches={label: matches[method]}, targets={f"fine_{field}": fine[field]},
+            xlabel="beta1", ylabel=field)
     old_plot = run_dir / "step2_observable" / "beta1_scan.png"
     if old_plot.exists():
         old_plot.unlink()
 
 
+def _method_key(cfg: dict, geometry: dict, *, method: str, kind: str,
+                renorm_type: str, **upstream: float) -> str:
+    return fingerprint({"scan": _scan_fingerprint(kind, cfg, geometry,
+                       renorm_type=renorm_type, **upstream), "method": method})
+
+
+def _search_fit(cfg: dict, scan: dict, measured: dict, phases: dict,
+                measure: Callable, observable: Callable, target: float,
+                target_err: float, *, initial: list[float], increasing: bool,
+                seed: int, censored_xi_G: bool = False) -> dict:
+    def add(value: float, phase: str) -> None:
+        phases.setdefault(value, set()).add(phase)
+        if not _same_point(value, set(measured)):
+            measured[value] = measure(value)
+
+    for value in initial:
+        add(value, "coarse")
+    expansion = refinement = 0
+    censored = None
+    for _ in range(int(scan["max_rounds"]) + int(scan["max_refine_rounds"]) + 2):
+        xs = np.array(sorted(measured))
+        ys = np.array([observable(measured[x])[0] for x in xs])
+        raw = _raw_scan_match(xs, ys, target)
+        censored = _censored_xi_G_bracket(xs, ys, target) if censored_xi_G else None
+        candidate, reason = _scan_decision(
+            raw, tolerance=float(scan["refine_tolerance"]),
+            max_refine=int(scan["max_refine_rounds"]), refine_count=refinement,
+            censored=censored)
+        if candidate is not None and not _same_point(candidate, set(measured)):
+            add(candidate, "refine")
+            refinement += 1
+            continue
+        if reason != "unbracketed":
+            break
+        if expansion >= int(scan["max_rounds"]):
+            reason = "max_rounds"
+            break
+        expanded = extend_scan(sorted(measured), raw,
+                               (float(scan["min"]), float(scan["max"])),
+                               float(scan["growth_factor"]))
+        additions = [x for x in expanded if not _same_point(x, set(measured))]
+        if not additions:
+            reason = "scan_limit"
+            break
+        for value in additions:
+            add(value, "coarse")
+        expansion += 1
+
+    def final_measure(value: float) -> dict:
+        phases.setdefault(value, set()).add("fit_candidate")
+        return measure(value)
+
+    match = _uniform_grid_match(
+        measured=measured, measure=final_measure, observable=observable,
+        target=target, target_err=target_err, increasing=increasing,
+        scan=scan, bootstrap_seed=int(cfg["runtime"]["seed"]) + seed)
+    for value in match.get("fit_points", []):
+        phases.setdefault(value, set()).add("final")
+    if censored and not match.get("bracketed"):
+        match["censored_bracket"] = censored
+        match["reason"] = "xi_G onset reached before a finite lower bracket point"
+    match.update(search_stop_reason=reason, expansion_rounds=expansion,
+                 refinement_rounds=refinement)
+    return match
+
+
+def _retain_scan(directory: Path, measured: dict, phases: dict, *, tag: str) -> tuple[dict, list[str]]:
+    keep = {value for value, labels in phases.items()
+            if labels & {"coarse", "final"}}
+    cleanup = _cleanup_candidates(measured, keep)
+    retained = {value: result for value, result in measured.items() if _same_point(value, keep)}
+    return write_scan_points(directory, retained, phases, tag=tag), cleanup
+
+
 def _run_beta1_scan(cfg: dict, run_dir: Path, geometry: dict,
                     beta_c: float, alpha_eff_c: float,
                     renorm_type: str | None = None) -> dict:
-    _log("step 2/4: observable beta1 scan")
+    methods = cfg["renormalization"]["beta1_methods"]
+    if not methods:
+        return {"matches": {}}
     settings, scan = section(cfg, "observable"), cfg["scan"]["beta1"]
-    m, R, Lf, Lc = cfg["model"], geometry["factor"], geometry["L_fine"], geometry["L_coarse"]
-    result_path = run_dir / "step2_observable" / "result.json"
+    m, R = cfg["model"], geometry["factor"]
     renorm_type = renorm_type or _renorm_types(cfg)[0]
-    result_key = _scan_fingerprint("beta1", cfg, geometry, renorm_type=renorm_type,
-                                   beta_c=beta_c,
-                                   alpha_eff_c=alpha_eff_c)
-    if result_path.exists() and not cfg.get("_force") and not cfg["runtime"]["auto_chains"]:
-        cached = json.loads(result_path.read_text(encoding="utf-8"))
-        if cached.get("fingerprint") == result_key:
-            _log("reuse completed step 2 (observable beta1 scan)")
-            cached_measured = {
-                float(value): observation
-                for value, observation in cached["coarse"].items()
-            }
-            _plot_beta1_scan(run_dir, R, cached["fine"], cached_measured,
-                             cached["matches"])
-            return cached
-    alpha_eff_f = float(m["alpha"] + m["alpha1"])
-    fine = _measure_point(cfg, run_dir, settings, tag="obs_fine", L=Lf,
-                          beta=float(m["beta"]), beta1=float(m["beta1"]),
-                          alpha=alpha_eff_f, alpha1=0.0, kind="half")
-    points, measured = _scan_points(scan), {}
-    matches: dict[str, dict] = {}
-    expansion = {"magsus": 0, "corr": 0}
-    refinement = {"magsus": 0, "corr": 0}
-    stop_reason = {"magsus": "unbracketed", "corr": "unbracketed"}
-    max_iterations = 2 * int(scan["max_rounds"]) + 2 * int(scan["max_refine_rounds"]) + 8
-    for _ in range(max_iterations):
-        for value in points:
-            if value not in measured:
-                measured[value] = _measure_point(
-                    cfg, run_dir, settings, tag="obs_coarse", L=Lc, beta=beta_c,
-                    beta1=value, alpha=alpha_eff_c, alpha1=0.0, kind="half")
-        xs = np.array(sorted(measured))
-        ordered = [measured[x] for x in xs]
-        magsus = np.array([r["magsus"] * R ** 2 for r in ordered])
-        xis = np.array([(float(r["xi"]) * R if r.get("xi") is not None else np.nan)
-                        for r in ordered])
-        magsus_err = np.array([r["magsus_err"] * R ** 2 for r in ordered])
-        xi_errs = np.array([(float(r["xi_err"]) * R
-                             if r.get("xi_err") is not None else np.nan)
-                            for r in ordered])
-        matches = {"magsus": _raw_scan_match(xs, magsus, float(fine["magsus"])),
-                   "corr": _raw_scan_match(xs, xis, float(fine["xi"]))}
-        censored = _censored_xi_bracket(xs, xis, float(fine["xi"]))
-        if censored is not None and not matches["corr"].get("bracketed"):
-            matches["corr"]["censored_bracket"] = censored
-        additions: set[float] = set()
-        for method in ("magsus", "corr"):
-            candidate, reason = _scan_decision(
-                matches[method], tolerance=float(scan["refine_tolerance"]),
-                max_refine=int(scan["max_refine_rounds"]),
-                refine_count=refinement[method],
-                censored=(censored if method == "corr" else None))
-            if candidate is not None and candidate not in measured:
-                additions.add(candidate)
-                refinement[method] += 1
-                stop_reason[method] = "refining"
-                continue
-            if reason != "unbracketed":
-                stop_reason[method] = reason
-                continue
-            if expansion[method] >= int(scan["max_rounds"]):
-                stop_reason[method] = "max_rounds"
-                continue
-            expanded = extend_scan(sorted(measured), matches[method],
-                                   (float(scan["min"]), float(scan["max"])),
-                                   float(scan["growth_factor"]))
-            new_values = [value for value in expanded if value not in measured]
-            if new_values:
-                additions.update(new_values)
-                expansion[method] += 1
-                stop_reason[method] = "expanding"
-            else:
-                stop_reason[method] = "scan_limit"
-        if not additions:
-            break
-        points = sorted(set(points) | additions)
-    def measure_beta1(value: float) -> dict:
-        return _measure_point(
-            cfg, run_dir, settings, tag="obs_coarse", L=Lc, beta=beta_c,
-            beta1=value, alpha=alpha_eff_c, alpha1=0.0, kind="half")
+    path = run_dir / "step2_observable" / "result.json"
+    cached = read_json(path) if path.exists() and not cfg.get("_force") else {}
+    keys = {name: _method_key(cfg, geometry, method=name, kind="beta1",
+                              renorm_type=renorm_type, beta_c=beta_c,
+                              alpha_eff_c=alpha_eff_c) for name in methods}
+    measured, phases = scan_measurements(run_dir, cached)
+    # Measurement parameters can change independently of method selection.
+    compatible = cached.get("measurement_key") == _scan_fingerprint(
+        "beta1", cfg, geometry, renorm_type=renorm_type,
+        beta_c=beta_c, alpha_eff_c=alpha_eff_c)
+    if not compatible:
+        measured, phases = {}, {}
+    matches = dict(cached.get("matches", {})) if compatible else {}
+    fingerprints = dict(cached.get("method_fingerprints", {})) if compatible else {}
+    fine_path = run_dir / cached.get("fine_path", "missing")
+    fine = load_point(fine_path.parent) if compatible and fine_path.is_file() else _measure_point(
+        cfg, run_dir, settings, tag="obs_fine", L=geometry["L_fine"],
+        beta=float(m["beta"]), beta1=float(m["beta1"]),
+        alpha=float(m["alpha"] + m["alpha1"]), alpha1=0.0, kind="half")
 
-    final_matches = {
-        "magsus": _uniform_grid_match(
-            measured=measured, measure=measure_beta1,
-            observable=lambda result: (float(result["magsus"]) * R ** 2,
-                                       float(result["magsus_err"]) * R ** 2),
-            target=float(fine["magsus"]), target_err=float(fine["magsus_err"]),
-            increasing=True, scan=scan,
-            bootstrap_seed=int(cfg["runtime"]["seed"]) + 201),
-        "corr": _uniform_grid_match(
-            measured=measured, measure=measure_beta1,
-            observable=lambda result: (
-                float(result["xi"]) * R if result.get("xi") is not None else np.nan,
-                float(result["xi_err"]) * R
-                if result.get("xi_err") is not None else np.nan),
-            target=float(fine["xi"]), target_err=float(fine["xi_err"]),
-            increasing=True, scan=scan,
-            bootstrap_seed=int(cfg["runtime"]["seed"]) + 202),
-    }
-    if censored is not None and not final_matches["corr"].get("bracketed"):
-        final_matches["corr"]["censored_bracket"] = censored
-    matches = final_matches
-    if not matches.get("corr", {}).get("bracketed") and matches.get("corr", {}).get(
-            "censored_bracket"):
-        matches["corr"]["reason"] = "xi onset reached before a finite lower bracket point"
-    for method, match in matches.items():
-        match["stop_reason"] = stop_reason[method]
-        match["search_stop_reason"] = stop_reason[method]
-        match["expansion_rounds"] = expansion[method]
-        match["refinement_rounds"] = refinement[method]
-    used = {float(value) for match in matches.values()
-            for value in match.get("fit_points", [])}
-    result = {"step": "observable_beta1", "fingerprint": result_key,
-              "fine": {"xi": fine["xi"],
-              "xi_err": fine["xi_err"], "magsus": fine["magsus"],
-              "magsus_err": fine["magsus_err"], "mode_tau": fine["mode_tau"],
-              "mode_ess": fine["mode_ess"], "sampling": fine["sampling"]},
-              "points": sorted(measured),
-              "coarse": {str(x): {"xi": measured[x]["xi"],
-                                   "xi_err": measured[x]["xi_err"],
-                                   "magsus": measured[x]["magsus"],
-                                   "magsus_err": measured[x]["magsus_err"],
-                                   "mode_tau": measured[x]["mode_tau"],
-                                   "mode_ess": measured[x]["mode_ess"],
-                                   "sampling": measured[x]["sampling"]}
-                         for x in sorted(measured)},
-              "matches": matches}
-    _plot_beta1_scan(run_dir, R, fine, measured, matches)
-    atomic_json(result_path, result)
-    return {**result, "_cleanup_folders": _cleanup_candidates(measured, used)}
+    def measure(value: float) -> dict:
+        return _measure_point(cfg, run_dir, settings, tag="obs_coarse",
+                              L=geometry["L_coarse"], beta=beta_c, beta1=value,
+                              alpha=alpha_eff_c, alpha1=0.0, kind="half")
+
+    for name in methods:
+        if fingerprints.get(name) == keys[name] and name in matches:
+            continue
+        descriptor = BETA1_METHODS[name]
+        field, scale = descriptor["field"], R ** descriptor["power"]
+
+        def observable(result: dict) -> tuple[float, float]:
+            return (float(result[field]) * scale if result.get(field) is not None else np.nan,
+                    float(result[field + "_err"]) * scale if result.get(field + "_err") is not None else np.nan)
+
+        matches[name] = _search_fit(
+            cfg, scan, measured, phases, measure, observable,
+            float(fine[field]), float(fine[field + "_err"]),
+            initial=_scan_points(scan), increasing=descriptor["increasing"],
+            seed=descriptor["seed"], censored_xi_G=field == "xi_G")
+        fingerprints[name] = _method_key(cfg, geometry, method=name, kind="beta1",
+            renorm_type=renorm_type, beta_c=beta_c, alpha_eff_c=alpha_eff_c)
+    entries, cleanup = _retain_scan(run_dir, measured, phases, tag="obs_coarse")
+    fine_entries = write_scan_points(run_dir, {0.0: fine}, {0.0: {"reference"}}, tag="obs_fine")
+    result = {"step": "observable_beta1", "measurement_key": _scan_fingerprint(
+        "beta1", cfg, geometry, renorm_type=renorm_type, beta_c=beta_c,
+        alpha_eff_c=alpha_eff_c), "fine_path": fine_entries["0.0"]["path"],
+        "measurements": entries, "matches": matches, "method_fingerprints": fingerprints}
+    atomic_json(path, result)
+    selected = {name: matches[name] for name in methods}
+    _plot_beta1_scan(run_dir, R, fine, measured, selected)
+    return {**result, "matches": selected, "_cleanup_folders": cleanup}
 
 
 def _run_one_plaq(cfg: dict, run_dir: Path, geometry: dict) -> dict:
@@ -586,8 +578,7 @@ def _run_one_plaq(cfg: dict, run_dir: Path, geometry: dict) -> dict:
     result_key = patch_result_key(cfg, geometry, "one_plaq")
     if result_path.exists() and not cfg.get("_force"):
         cached = json.loads(result_path.read_text(encoding="utf-8"))
-        if (cached.get("cache_schema") == PATCH_CACHE_SCHEMA and
-                cached.get("fingerprint") == result_key):
+        if cached.get("fingerprint") == result_key:
             _log("reuse completed step 3a (1plaq)")
             return cached
     _log("step 3a/4: 1plaq alpha fit")
@@ -602,7 +593,8 @@ def _run_one_plaq(cfg: dict, run_dir: Path, geometry: dict) -> dict:
     else:
         fits["U"] = isolated_fit("one_plaq", {"p0": float(p0["U"])},
                                   X=raw["X_s"], freq=raw["freq_s"])
-    atomic_npz(run_dir / "step3a_1plaq" / "measurements.npz", **raw)
+    if cfg["storage"]["save_npz"]:
+        atomic_npz(run_dir / "step3a_1plaq" / "measurements.npz", **raw)
     stop_reasons = np.asarray(raw["sampling_stop_reason"]).astype(str)
     warmup_reasons = np.asarray(raw["warmup_stop_reason"]).astype(str)
     outer_warmup_reasons = np.asarray(raw["outer_warmup_stop_reason"]).astype(str)
@@ -617,7 +609,7 @@ def _run_one_plaq(cfg: dict, run_dir: Path, geometry: dict) -> dict:
         warnings.append(f"HMC acceptance {patch_accept:.3f} outside configured range")
     if warnings and cfg["diagnostics"].get("strict"):
         raise RuntimeError("one_plaq diagnostics failed: " + "; ".join(warnings))
-    result = {"step": "one_plaq", "cache_schema": PATCH_CACHE_SCHEMA,
+    result = {"step": "one_plaq",
               "fingerprint": result_key, "fits": fits,
               "accept_rate": float(np.mean(raw["accept_rate"])),
               "s_accept_rate": (float(np.mean(raw["s_accept_rate"]))
@@ -652,230 +644,144 @@ def _run_one_plaq(cfg: dict, run_dir: Path, geometry: dict) -> dict:
 def _default_alpha_points(center: float, scan: dict) -> list[float]:
     if scan.get("points"):
         return _scan_points(scan)
-    values = (center * np.linspace(0.8, 1.2, 5) if center > 0 else
-              np.linspace(0.0, min(0.4, float(scan["max"])), 5))
     lo, hi = float(scan["min"]), float(scan["max"])
-    points = sorted(set(max(lo, min(hi, float(x))) for x in values))
-    if len(points) < 2:
-        upper = min(hi, max(lo * 1.5, lo + 0.001))
-        points = sorted(set(float(x) for x in np.linspace(lo, upper, 5)))
-    return points
+    spacing = min(0.1, (hi - lo) / 2)
+    return [lo + i * spacing for i in range(3)]
 
 
 def _run_topo(cfg: dict, run_dir: Path, geometry: dict, beta_c: float,
-              alpha_eff_c: float, beta1_matches: dict, alpha_1plaq: float,
+              alpha_eff_c: float, beta1_matches: dict, alpha_1plaq: float | None = None,
               renorm_type: str | None = None) -> dict:
-    _log("step 3b/4: topological alpha scans")
+    methods = cfg["renormalization"]["beta1_methods"]
     settings, scan = section(cfg, "topo"), cfg["scan"]["alpha"]
-    m, R, Lf, Lc = cfg["model"], geometry["factor"], geometry["L_fine"], geometry["L_coarse"]
-    result_path = run_dir / "step3b_topo" / "result.json"
+    m, R = cfg["model"], geometry["factor"]
     renorm_type = renorm_type or _renorm_types(cfg)[0]
-    result_key = _scan_fingerprint(
-        "alpha", cfg, geometry, renorm_type=renorm_type,
-        beta_c=beta_c, alpha_eff_c=alpha_eff_c,
-        alpha_1plaq=alpha_1plaq,
-        beta1_magsus=beta1_matches["magsus"].get("value"),
-        beta1_corr=beta1_matches["corr"].get("value"))
-    if result_path.exists() and not cfg.get("_force") and not cfg["runtime"]["auto_chains"]:
-        cached = json.loads(result_path.read_text(encoding="utf-8"))
-        if cached.get("fingerprint") == result_key:
-            _log("reuse completed step 3b (topological alpha scans)")
-            return cached
-    fine_kind = "full" if (renorm_type == "U"
-                           or abs(float(m["alpha"])) > 1e-12) else "half"
-    fine_alpha = float(m["alpha"]) if fine_kind == "full" else float(m["alpha1"])
-    fine_alpha1 = float(m["alpha1"]) if fine_kind == "full" else 0.0
-    fine = _measure_point(cfg, run_dir, settings, tag="topo_fine", L=Lf,
-                          beta=float(m["beta"]), beta1=float(m["beta1"]),
-                          alpha=fine_alpha, alpha1=fine_alpha1, kind=fine_kind)
-    fine_comp = "Q_s" if renorm_type == "U" else "Q_z"
-    target = fine["topology"][fine_comp]["topo_sus"] * R ** 2
-    target_err = fine["topology"][fine_comp]["err"] * R ** 2
-    all_results = {}
-    cleanup_folders: list[str] = []
-    for method in ("magsus", "corr"):
-        bmatch = beta1_matches[method]
-        if not bmatch.get("bracketed"):
-            all_results[method] = {"value": None, "reason": "beta1 was not bracketed"}
+    path = run_dir / "step3b_topo" / "result.json"
+    cached = read_json(path) if path.exists() and not cfg.get("_force") else {}
+    fine_kind = "full" if renorm_type == "U" or abs(float(m["alpha"])) > 1e-12 else "half"
+    component = "Q_s" if renorm_type == "U" else "Q_z"
+    fine_parameters = dict(tag="topo_fine", L=geometry["L_fine"],
+        beta=float(m["beta"]), beta1=float(m["beta1"]), kind=fine_kind,
+        alpha=float(m["alpha"]) if fine_kind == "full" else float(m["alpha1"]),
+        alpha1=float(m["alpha1"]) if fine_kind == "full" else 0.0)
+    fine_key = fingerprint({"parameters": fine_parameters, "settings": settings,
+                            "runtime": cfg["runtime"], "N": m["N"], "mod": m["mod"]})
+    fine_path = run_dir / cached.get("fine_path", "missing")
+    fine = load_point(fine_path.parent) if cached.get("fine_key") == fine_key and fine_path.is_file() else _measure_point(
+        cfg, run_dir, settings, **fine_parameters)
+    target = float(fine["topology"][component]["topo_sus"]) * R ** 2
+    target_err = float(fine["topology"][component]["err"]) * R ** 2
+    matches = dict(cached.get("matches", {}))
+    fingerprints = dict(cached.get("method_fingerprints", {}))
+    cleanup = []
+    for name in methods:
+        beta_match = beta1_matches[name]
+        if not beta_match.get("bracketed"):
+            matches[name] = {"value": None, "error": None, "reason": "beta1 was not bracketed"}
+            fingerprints.pop(name, None)
             continue
-        beta1_c, points, measured = float(bmatch["value"]), _default_alpha_points(alpha_1plaq, scan), {}
-        match = {}
-        expansion = 0
-        refinement = 0
-        stop_reason = "unbracketed"
-        max_iterations = 2 * int(scan["max_rounds"]) + 2 * int(scan["max_refine_rounds"]) + 8
-        for _ in range(max_iterations):
-            for alpha in points:
-                if alpha not in measured:
-                    measured[alpha] = _measure_point(
-                        cfg, run_dir, settings, tag=f"topo_coarse_{method}", L=Lc,
-                        beta=beta_c, beta1=beta1_c, alpha=alpha,
-                        alpha1=alpha_eff_c - alpha, kind="full")
-            xs = np.array(sorted(measured))
-            ys = np.array([measured[x]["topology"]["Q_s"]["topo_sus"] for x in xs])
-            errs = np.array([measured[x]["topology"]["Q_s"]["err"] for x in xs])
-            match = _raw_scan_match(xs, ys, target)
-            candidate, reason = _scan_decision(
-                match, tolerance=float(scan["refine_tolerance"]),
-                max_refine=int(scan["max_refine_rounds"]),
-                refine_count=refinement)
-            if candidate is not None and candidate not in measured:
-                points = sorted(set(points) | {candidate})
-                refinement += 1
-                stop_reason = "refining"
-                continue
-            if reason != "unbracketed":
-                stop_reason = reason
-                break
-            if expansion >= int(scan["max_rounds"]):
-                stop_reason = "max_rounds"
-                break
-            new_points = extend_scan(points, match, (float(scan["min"]),
-                                     float(scan["max"])), float(scan["growth_factor"]))
-            if new_points == points:
-                stop_reason = "scan_limit"
-                break
-            points = new_points
-            expansion += 1
-            stop_reason = "expanding"
-        def measure_alpha(value: float) -> dict:
-            return _measure_point(
-                cfg, run_dir, settings, tag=f"topo_coarse_{method}", L=Lc,
-                beta=beta_c, beta1=beta1_c, alpha=value,
+        beta1_c = float(beta_match["value"])
+        key = _method_key(cfg, geometry, method=name, kind="alpha",
+                          renorm_type=renorm_type, beta_c=beta_c,
+                          alpha_eff_c=alpha_eff_c, beta1_c=beta1_c)
+        if fingerprints.get(name) == key and name in matches:
+            continue
+        previous = matches.get(name, {}) if fingerprints.get(name) == key else {}
+        measured, phases = scan_measurements(run_dir, previous)
+
+        def measure(value: float) -> dict:
+            return _measure_point(cfg, run_dir, settings, tag=f"topo_coarse_{name}",
+                L=geometry["L_coarse"], beta=beta_c, beta1=beta1_c, alpha=value,
                 alpha1=alpha_eff_c - value, kind="full")
 
-        match = _uniform_grid_match(
-            measured=measured, measure=measure_alpha,
-            observable=lambda result: (
-                float(result["topology"]["Q_s"]["topo_sus"]),
-                float(result["topology"]["Q_s"]["err"])),
-            target=float(target), target_err=float(target_err), increasing=False,
-            scan=scan, bootstrap_seed=int(cfg["runtime"]["seed"]) +
-                                      (301 if method == "magsus" else 302))
-        match["stop_reason"] = stop_reason
-        match["search_stop_reason"] = stop_reason
-        match["expansion_rounds"] = expansion
-        match["refinement_rounds"] = refinement
-        used = {float(value) for value in match.get("fit_points", [])}
-        cleanup_folders.extend(_cleanup_candidates(measured, used))
-        all_results[method] = {**match, "beta1_c": beta1_c,
-                               "points": sorted(measured), "target": target,
-                               "target_err": target_err,
-                               "measurements": {str(x): {
-                                   "value": measured[x]["topology"]["Q_s"]["topo_sus"],
-                                   "error": measured[x]["topology"]["Q_s"]["err"],
-                                   "tau": measured[x]["topology"]["Q_s"]["tau"],
-                                   "ess": measured[x]["topology"]["Q_s"]["ess"],
-                                   "sampling": measured[x]["sampling"]}
-                                   for x in sorted(measured)}}
+        def observable(result: dict) -> tuple[float, float]:
+            t = result["topology"]["Q_s"]
+            return float(t["topo_sus"]), float(t["err"])
+
+        match = _search_fit(cfg, scan, measured, phases, measure, observable,
+            target, target_err, initial=_default_alpha_points(0.0, scan),
+            increasing=False, seed=int(BETA1_METHODS[name]["seed"]) + 100)
+        entries, unused = _retain_scan(run_dir, measured, phases, tag=f"topo_coarse_{name}")
+        cleanup.extend(unused)
+        match.update(beta1_c=beta1_c, measurements=entries)
+        matches[name] = match
+        fingerprints[name] = _method_key(cfg, geometry, method=name, kind="alpha",
+            renorm_type=renorm_type, beta_c=beta_c, alpha_eff_c=alpha_eff_c,
+            beta1_c=beta1_c)
         xs = np.array(sorted(measured))
-        isolated_plot(run_dir / "step3b_topo" / f"alpha_scan_{method}.png", x=xs,
-                      series={"topo_sus_Qs": np.array([
-                          measured[x]["topology"]["Q_s"]["topo_sus"] for x in xs])},
-                      errors={"topo_sus_Qs": np.array([
-                          measured[x]["topology"]["Q_s"]["err"] for x in xs])},
-                      matches={"topo_sus_Qs": match},
-                      targets={f"fine_{fine_comp}_scaled": target},
-                      colors={"topo_sus_Qs": "tab:purple",
-                              f"fine_{fine_comp}_scaled": "tab:purple"},
-                      xlabel="alpha", ylabel="topological susceptibility")
-    result = {"step": "topo_alpha", "fingerprint": result_key,
-              "fine_component": fine_comp,
-              "fine_target": target, "fine_target_err": target_err,
-              "fine_tau": fine["topology"][fine_comp]["tau"],
-              "fine_ess": fine["topology"][fine_comp]["ess"],
-              "fine_sampling": fine["sampling"], "matches": all_results}
-    atomic_json(result_path, result)
-    return {**result, "_cleanup_folders": cleanup_folders}
+        isolated_plot(run_dir / "step3b_topo" / f"alpha_scan_{name}.png", x=xs,
+            series={"topo_sus_Qs": np.array([observable(measured[x])[0] for x in xs])},
+            errors={"topo_sus_Qs": np.array([observable(measured[x])[1] for x in xs])},
+            matches={"topo_sus_Qs": match}, targets={f"fine_{component}_scaled": target},
+            xlabel="alpha", ylabel="topological susceptibility")
+    fine_entries = write_scan_points(run_dir, {0.0: fine}, {0.0: {"reference"}}, tag="topo_fine")
+    fine_key = fingerprint({"parameters": fine_parameters, "settings": section(cfg, "topo"),
+                            "runtime": cfg["runtime"], "N": m["N"], "mod": m["mod"]})
+    result = {"step": "topo_alpha", "fine_key": fine_key,
+              "fine_path": fine_entries["0.0"]["path"], "fine_component": component,
+              "matches": matches, "method_fingerprints": fingerprints}
+    atomic_json(path, result)
+    # Another method may share the same physical ensemble.
+    retained = {str((run_dir / entry["path"]).parent.resolve())
+                for match in matches.values() for entry in match.get("measurements", {}).values()}
+    cleanup = [folder for folder in cleanup if str(Path(folder).resolve()) not in retained]
+    return {**result, "matches": {name: matches[name] for name in methods},
+            "_cleanup_folders": cleanup}
 
 
 def _branch_summary(cfg: dict, run_name: str, renorm_type: str, geometry: dict,
                     beta_c: float, alpha_eff_c: float, alpha_1: float | None,
                     step2: dict, topo: dict, *, fit2: dict | None = None,
                     fit1: dict | None = None) -> dict:
+    """Keep complete coupling combinations and their errors together."""
     fit2, fit1 = fit2 or {}, fit1 or {}
-    beta1 = {k: (float(v["value"]) if v.get("value") is not None else None)
-             for k, v in step2["matches"].items()}
-    beta1_err = {k: (float(v["error"]) if v.get("error") is not None else None)
-                 for k, v in step2["matches"].items()}
-    atop = {k: (float(v["value"]) if v.get("value") is not None else None)
-            for k, v in topo["matches"].items()}
-    atop_err = {k: (float(v["error"]) if v.get("error") is not None else None)
-                for k, v in topo["matches"].items()}
-
-    def combo(bkey: str, alpha: float | None, alpha_err: float | None) -> dict:
-        return {"beta_c": beta_c, "beta1_c": beta1[bkey], "alpha_c": alpha,
-                "alpha1_c": (float(alpha_eff_c - alpha) if alpha is not None else None),
-                "alpha_eff_c": alpha_eff_c, "beta_c_err": fit2.get("beta_err"),
-                "alpha_eff_c_err": fit2.get("alpha_eff_err"),
-                "beta1_c_err": beta1_err[bkey], "alpha_c_err": alpha_err}
-
-    combos = {"magsus_obs_fit_topo": combo("magsus", atop["magsus"], atop_err["magsus"]),
-              "corr_obs_fit_topo": combo("corr", atop["corr"], atop_err["corr"]),
-              "magsus_1plaq": combo("magsus", alpha_1, fit1.get("alpha_err")),
-              "corr_1plaq": combo("corr", alpha_1, fit1.get("alpha_err"))}
-    def toml_fragment(values: dict) -> str | None:
-        fields = (values["beta_c"], values["beta1_c"],
-                  values["alpha_c"], values["alpha1_c"])
-        if any(value is None for value in fields):
-            return None
-        return (f"beta = {float(fields[0])!r}\n"
-                f"beta1 = {float(fields[1])!r}\n"
-                f"alpha = {float(fields[2])!r}\n"
-                f"alpha1 = {float(fields[3])!r}")
-
-    def fit_design(match: dict) -> dict:
-        preliminary = match.get("preliminary", {})
-        return {"preliminary_value": preliminary.get("value"),
-                "preliminary_error": preliminary.get("error"),
-                "fit_spacing": match.get("fit_spacing"),
-                "fit_grid": match.get("fit_grid", []),
-                "fit_grid_rounds": match.get("fit_grid_rounds", 0),
-                "grid_validation": match.get("grid_validation"),
-                "reason": match.get("reason")}
-
-    summary = {"run_name": run_name,
-               "run_id": f"{run_name}/{renorm_type}_mod{cfg['model']['mod']}",
-               "renormalization_type": renorm_type,
-               "mod": cfg["model"]["mod"],
-               "chains": dict(cfg["chains"]),
-               "chains_source": "auto" if cfg["runtime"]["auto_chains"] else "toml",
-               "config_fingerprint": config_fingerprint(cfg),
-               "created_at": datetime.now().isoformat(timespec="seconds"),
-               "device": str(resolve_device(cfg["runtime"]["device"])),
-               "geometry": geometry,
-               "renormalized_couplings": {"beta_c": beta_c, "alpha_eff_c": alpha_eff_c,
-                                            "beta_c_err": fit2.get("beta_err"),
-                                            "alpha_eff_c_err": fit2.get("alpha_eff_err"),
-                                            "beta1_c": beta1, "beta1_c_err": beta1_err,
-                                            "alpha_c_1plaq": alpha_1,
-                                            "alpha_c_1plaq_err": fit1.get("alpha_err"),
-                                            "alpha_c_topo": atop,
-                                            "alpha_c_topo_err": atop_err},
-               "fit_points": {
-                   "beta1": {name: value.get("fit_points", [])
-                             for name, value in step2["matches"].items()},
-                   "alpha": {name: value.get("fit_points", [])
-                            for name, value in topo["matches"].items()}},
-               "fit_design": {
-                   "beta1": {name: fit_design(value)
-                             for name, value in step2["matches"].items()},
-                   "alpha": {name: fit_design(value)
-                            for name, value in topo["matches"].items()}},
-               "four_combos": combos,
-               "renorm_as_fine": {name: fragment for name, value in combos.items()
-                                  if (fragment := toml_fragment(value)) is not None}}
-    return summary
+    beta_methods = cfg["renormalization"]["beta1_methods"]
+    alpha_methods = cfg["renormalization"]["alpha_methods"]
+    results, fragments = {}, {}
+    for beta_method in beta_methods or [None]:
+        beta_match = step2.get("matches", {}).get(beta_method, {})
+        for alpha_method in alpha_methods or [None]:
+            if alpha_method == "1plaq":
+                alpha, alpha_err = alpha_1, fit1.get("alpha_err")
+            elif alpha_method == "topo":
+                match = topo.get("matches", {}).get(beta_method, {})
+                alpha, alpha_err = match.get("value"), match.get("error")
+            else:
+                alpha = alpha_err = None
+            name = (f"{beta_method}_obs_fit_topo" if alpha_method == "topo" else
+                    "_".join(x for x in (beta_method, alpha_method) if x) or "unfitted")
+            couplings = {"beta": beta_c, "beta1": beta_match.get("value"),
+                         "alpha": alpha,
+                         "alpha1": alpha_eff_c - alpha if alpha is not None else None,
+                         "alpha_eff": alpha_eff_c}
+            errors = {"beta": fit2.get("beta_err"), "beta1": beta_match.get("error"),
+                      "alpha": alpha_err, "alpha_eff": fit2.get("alpha_eff_err")}
+            results[name] = {"couplings": couplings, "errors": errors}
+            if all(couplings[key] is not None for key in ("beta", "beta1", "alpha", "alpha1")):
+                fragments[name] = "\n".join(f"{key} = {couplings[key]!r}"
+                                            for key in ("beta", "beta1", "alpha", "alpha1"))
+    return {"results": results, "renorm_as_fine": fragments}
 
 
-def _run_mod_pipeline(cfg: dict, output_root: str | Path, *, skip_topo: bool = False) -> dict:
+def _run_mod_pipeline(cfg: dict, output_root: str | Path) -> dict:
     run_name = Path(cfg["_config_path"]).stem
     run_dir = workspace_dir(cfg, output_root)
     run_dir.mkdir(parents=True, exist_ok=True)
     atomic_copy(cfg["_config_path"], run_dir / "input.toml")
-    _log(f"run {run_name} on {resolve_device(cfg['runtime']['device'])}")
     common_dir = Path(cfg.get("_common_dir", run_dir))
     shared = cfg["_shared_common"]
+    resolved_path = run_dir / "resolved.json"
+    previous = read_json(resolved_path) if resolved_path.exists() else {}
+    previous_chains = previous.get("chains", {})
+    if cfg["runtime"]["auto_chains"] and not cfg.get("_force"):
+        for kind in _renorm_types(cfg):
+            widths = previous_chains.get(f"{kind}_mod{cfg['model']['mod']}", {})
+            if widths:
+                cfg["chains"].update(widths)
+                break
+    alpha_methods = cfg["renormalization"]["alpha_methods"]
+    need_one = ("1plaq" in alpha_methods and
+                ("z" in _renorm_types(cfg) or abs(float(cfg["model"]["alpha"])) >= 1e-12))
     if shared:
         pilot, two_plaq, one_plaq, common_chains = shared[0]
         cfg["chains"].update(common_chains)
@@ -887,82 +793,58 @@ def _run_mod_pipeline(cfg: dict, output_root: str | Path, *, skip_topo: bool = F
         if cfg["runtime"]["auto_chains"]:
             from .chain_tuning import _workloads, tune_stage
             workloads = _workloads(common_cfg, pilot)
-            tune_stage(common_cfg, "two_plaq", workloads["two_plaq"])
-            if "z" in _renorm_types(cfg) or abs(float(cfg["model"]["alpha"])) >= 1e-12:
-                tune_stage(common_cfg, "one_plaq", workloads["one_plaq"])
+            two_path = common_dir / "step1_2plaq" / "result.json"
+            if (cfg.get("_force") or not two_path.exists() or
+                    read_json(two_path).get("fingerprint") != patch_result_key(common_cfg, geometry, "two_plaq")):
+                tune_stage(common_cfg, "two_plaq", workloads["two_plaq"])
+            if need_one:
+                one_path = common_dir / "step3a_1plaq" / "result.json"
+                if (cfg.get("_force") or not one_path.exists() or
+                        read_json(one_path).get("fingerprint") != patch_result_key(common_cfg, geometry, "one_plaq")):
+                    tune_stage(common_cfg, "one_plaq", workloads["one_plaq"])
         two_plaq = _run_two_plaq(common_cfg, common_dir, geometry)
-        need_one = "z" in _renorm_types(cfg) or abs(float(cfg["model"]["alpha"])) >= 1e-12
-        one_plaq = (_run_one_plaq(common_cfg, common_dir, geometry) if need_one else
-                    {"fits": {"U": {"alpha": None,
-                                      "reason": "fine s sector is unconstrained when model.alpha=0"}}})
+        one_plaq = _run_one_plaq(common_cfg, common_dir, geometry) if need_one else {"fits": {}}
         common_chains = {key: common_cfg["chains"][key]
                          for key in ("pilot", "two_plaq", "one_plaq")}
         cfg["chains"].update(common_chains)
         shared.append((pilot, two_plaq, one_plaq, common_chains))
     geometry = pilot["geometry"]
-    _log(f"pilot xi={pilot['xi']:.6g}±{pilot['xi_err']:.2g}; "
-         f"padding={geometry['padding']} Lf={geometry['L_fine']} Lc={geometry['L_coarse']}")
-    types = _renorm_types(cfg)
-    branches = {}
-    for renorm_type in types:
+    branches, chains = {}, {}
+    for renorm_type in _renorm_types(cfg):
         branch_name = f"{renorm_type}_mod{cfg['model']['mod']}"
         branch_dir = run_dir / "branches" / branch_name
         cfg["_tuning_prefix"] = f"{branch_name}/"
+        if cfg["runtime"]["auto_chains"] and not cfg.get("_force"):
+            cfg["chains"].update({key: value for key, value in
+                previous_chains.get(branch_name, {}).items()
+                if key.startswith(("observable_", "topo_"))})
         cfg["_tuned_measurements"] = set()
         fit2 = two_plaq["fits"][renorm_type]
-        beta_c = float(fit2["beta"])
-        alpha_eff_c = float(fit2["alpha_eff"])
-        _log(f"{branch_name} beta_c={beta_c!r} err={fit2.get('beta_err')!r}; "
-             f"alpha_eff_c={alpha_eff_c!r} err={fit2.get('alpha_eff_err')!r}")
-        step2 = _run_beta1_scan(cfg, branch_dir, geometry, beta_c, alpha_eff_c,
+        beta_c, alpha_eff_c = float(fit2["beta"]), float(fit2["alpha_eff"])
+        step2 = (_run_beta1_scan(cfg, branch_dir, geometry, beta_c, alpha_eff_c,
                                 renorm_type=renorm_type)
-        _log(f"{renorm_type} beta1 matches: {step2['matches']}")
+                 if cfg["renormalization"]["beta1_methods"] else {"matches": {}})
         fit1 = one_plaq.get("fits", {}).get(renorm_type, {})
-        alpha_value = fit1.get("alpha")
-        alpha_1 = float(alpha_value) if alpha_value is not None else None
-        unavailable = renorm_type == "U" and alpha_1 is None
-        if unavailable:
-            topo = {"matches": {"magsus": {"value": None},
-                                "corr": {"value": None}},
-                    "skipped": fit1.get("reason", "U 1plaq result unavailable")}
-        elif skip_topo:
-            topo = {"matches": {"magsus": {"value": None},
-                                "corr": {"value": None}},
-                    "skipped": "--skip-topo"}
+        alpha_1 = fit1.get("alpha")
+        unavailable = renorm_type == "U" and abs(float(cfg["model"]["alpha"])) < 1e-12
+        if "topo" not in alpha_methods or unavailable:
+            topo = {"matches": {}}
         else:
             topo = _run_topo(cfg, branch_dir, geometry, beta_c, alpha_eff_c,
-                             step2["matches"], float(alpha_1),
-                             renorm_type=renorm_type)
-        summary = _branch_summary(cfg, run_name, renorm_type, geometry,
-                                  beta_c, alpha_eff_c, alpha_1, step2, topo,
-                                  fit2=fit2, fit1=fit1)
-        cleanup = list(step2.get("_cleanup_folders", [])) + list(
-            topo.get("_cleanup_folders", []))
-        removed = _remove_scan_ensembles(branch_dir, cleanup)
-        summary["cleanup"] = {"removed_unused_coarse_ensembles": removed,
-                              "count": len(removed)}
-        atomic_json(branch_dir / "summary.json", summary)
-        branches[branch_name] = summary
-
-    summary = {"run_name": run_name, "run_id": run_name,
-               "config_fingerprint": config_fingerprint(cfg),
-               "created_at": datetime.now().isoformat(timespec="seconds"),
-               "device": str(resolve_device(cfg["runtime"]["device"])),
-               "geometry": geometry, "types": types,
-               "pilot": pilot,
-               "common_plaquette_fits": {"two_plaq": two_plaq["fits"],
-                                          "one_plaq": one_plaq.get("fits", {})},
-               "branches": branches}
-    return summary
+                             step2["matches"], alpha_1, renorm_type=renorm_type)
+        branches[branch_name] = _branch_summary(
+            cfg, run_name, renorm_type, geometry, beta_c, alpha_eff_c, alpha_1,
+            step2, topo, fit2=fit2, fit1=fit1)
+        cleanup = list(step2.get("_cleanup_folders", [])) + list(topo.get("_cleanup_folders", []))
+        _remove_scan_ensembles(branch_dir, cleanup)
+        chains[branch_name] = dict(cfg["chains"])
+    return {"geometry": geometry, "pilot": pilot, "branches": branches, "chains": chains}
 
 
-def run_pipeline(cfg: dict, output_root: str | Path, *, skip_topo: bool = False) -> dict:
-    """Run type/mod branches, sharing mod-independent fine ensembles."""
+def run_pipeline(cfg: dict, output_root: str | Path) -> dict:
+    """Run only requested methods, sharing compatible type/mod measurements."""
     run_dir = workspace_dir(cfg, output_root)
-    shared: list = []
-    records: dict = {}
-    results = {}
-    branches = {}
+    shared, records, results, branches, chains = [], {}, {}, {}, {}
     try:
         for mod in cfg["model"]["mod"]:
             branch_cfg = mod_config(cfg, mod)
@@ -971,31 +853,29 @@ def run_pipeline(cfg: dict, output_root: str | Path, *, skip_topo: bool = False)
             branch_cfg["_shared_common"] = [] if independent else shared
             branch_cfg["_tuning_records"] = records
             branch_cfg["_tuning_prefix"] = f"common_mod{mod}/" if independent else "common/"
-            result = _run_mod_pipeline(branch_cfg, output_root, skip_topo=skip_topo)
+            result = _run_mod_pipeline(branch_cfg, output_root)
             results[f"mod{mod}"] = result
             branches.update(result["branches"])
-        summary = {"run_name": Path(cfg["_config_path"]).stem,
-                   "run_id": Path(cfg["_config_path"]).stem,
-                   "created_at": datetime.now().isoformat(timespec="seconds"),
-                   "config_fingerprint": config_fingerprint(cfg),
-                   "device": str(resolve_device(cfg["runtime"]["device"])),
-                   "types": _renorm_types(cfg), "mods": cfg["model"]["mod"],
-                   "geometries": {name: item["geometry"] for name, item in results.items()},
-                   "chains_source": "auto" if cfg["runtime"]["auto_chains"] else "toml",
-                   "chains": {name: item["chains"] for name, item in branches.items()},
-                   "common_plaquette_fits": {name: item["common_plaquette_fits"]
-                                              for name, item in results.items()},
-                   "branches": branches}
-        atomic_json(run_dir / "resolved.json", {
-            "config": {key: value for key, value in cfg.items() if not key.startswith("_")},
-            "chains_source": summary["chains_source"], "chains": summary["chains"],
-            "pilots": {name: item["pilot"] for name, item in results.items()}})
+            chains.update(result["chains"])
+        geometries = {name: item["geometry"] for name, item in results.items()}
+        summary = {"model": cfg["model"], "renormalization": cfg["renormalization"],
+                   "geometries": geometries, "branches": branches}
+        resolved_path = run_dir / "resolved.json"
+        resolved = read_json(resolved_path) if resolved_path.exists() else {}
+        resolved.update(config={k: v for k, v in cfg.items() if not k.startswith("_")},
+                        geometries=geometries, chains=chains)
+        # Pilot details have a single owner: pilot/result.json.
+        resolved.pop("pilots", None)
+        resolved.pop("chains_source", None)
+        atomic_json(resolved_path, resolved)
         atomic_json(run_dir / "summary.json", summary)
         _log(f"done: {run_dir / 'summary.json'}")
         return summary
     finally:
         if cfg["runtime"]["auto_chains"]:
-            atomic_json(run_dir / "chain_tuning.json", {
+            report_path = run_dir / "chain_tuning.json"
+            previous_report = read_json(report_path) if report_path.exists() else {}
+            atomic_json(report_path, {
                 "device": str(resolve_device(cfg["runtime"]["device"])),
-                "dtype": cfg["runtime"]["dtype"], "stages": records,
-                "chains": {name: item["chains"] for name, item in branches.items()}})
+                "dtype": cfg["runtime"]["dtype"],
+                "stages": {**previous_report.get("stages", {}), **records}})

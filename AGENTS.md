@@ -17,7 +17,7 @@ python -m unittest discover -s tests -v
 python -m compileall -q cpn_renorm tests
 ```
 
-`validate` checks configuration without starting a simulation. `pilot` estimates the fine-lattice correlation length and derived padding/observable sizes. `run` executes the complete fitting pipeline; use `--skip-topo` when appropriate. Run CUDA work in an environment where `torch.cuda.is_available()` is true.
+`validate` checks configuration without starting a simulation. `pilot` estimates the fine-lattice correlation length and derived padding/observable sizes. `run` executes the fitting methods selected by `renormalization.beta1_methods` and `renormalization.alpha_methods` in TOML. Run CUDA work in an environment where `torch.cuda.is_available()` is true.
 
 ## Coding Style & Naming Conventions
 

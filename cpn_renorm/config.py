@@ -8,22 +8,27 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from .methods import ALPHA_METHODS, BETA1_METHODS
+
 
 DEFAULTS: dict[str, Any] = {
+    "storage": {"save_npz": False},
+    "renormalization": {"beta1_methods": ["magsus", "corrG"],
+                        "alpha_methods": ["1plaq", "topo"]},
     "runtime": {"device": "auto", "dtype": "float64", "seed": 1729,
                 "auto_chains": False},
     "chains": {"pilot": 16, "two_plaq": 32, "observable_fine": 16,
                "observable_coarse": 16, "one_plaq": 32,
                "topo_fine": 16, "topo_coarse": 16},
     "pilot": {"initial_L": 16, "max_L": 256,
-              "min_L_over_xi": 8.0,
+              "min_L_over_xi_G": 8.0,
               "growth_factor": 2.0, "min_warmup": 300, "max_warmup": 4000,
               "min_meas_total": 4800, "target_ess": 200,
               "max_meas_total": 19200},
     "geometry": {"boundary_bc": "OBC", "padding": -1, "coarse_L": -1,
                  "padding_min": -1, "padding_max": -1,
                  "coarse_L_min": -1, "coarse_L_max": -1,
-                 "padding_xi_mul": 3.0, "obs_L_xi_mul": 10.0},
+                 "padding_xi_G_mul": 3.0, "obs_L_xi_G_mul": 10.0},
     "hmc": {"epsilon": 0.05, "trajectory_length": 1.0, "mass_a": 1.0,
             "mass_z": 1.0, "target_accept": 0.75, "adapt_steps": 200,
             "s_step": 0.5, "s_updates": 1, "warmup_tau_multiplier": 10.0,
@@ -65,7 +70,10 @@ DEFAULTS: dict[str, Any] = {
 }
 
 OBSOLETE_FIELDS = {
-    "bootstrap_samples": "remove it; xi uncertainty now uses the Gamma method",
+    "min_L_over_xi": "rename it to min_L_over_xi_G",
+    "padding_xi_mul": "rename it to padding_xi_G_mul",
+    "obs_L_xi_mul": "rename it to obs_L_xi_G_mul",
+    "bootstrap_samples": "remove it; xi_G uncertainty now uses the Gamma method",
     "n_meas": "use min_meas_total, target_ess, and max_meas_total",
     "n_meas_total": "rename it to min_meas_total",
     "meas_interval": "remove it; every HMC sweep is measured",
@@ -90,6 +98,29 @@ def _merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
                     if isinstance(value, dict) and isinstance(out.get(key), dict)
                     else value)
     return out
+
+
+def resolve_config_path(path: str | Path) -> Path:
+    """Resolve CLI paths, searching cwd/configs recursively for bare names."""
+    path = Path(path)
+    config_root = Path.cwd() / "configs"
+    if not path.is_absolute() and len(path.parts) == 1:
+        matches = sorted(candidate for candidate in config_root.rglob("*")
+                         if candidate.is_file() and candidate.name == path.name)
+        if len(matches) > 1:
+            candidates = "\n".join(f"  {candidate.relative_to(config_root)}"
+                                   for candidate in matches)
+            raise ValueError(
+                f"ambiguous configuration {str(path)!r}; specify a path:\n{candidates}")
+        if matches:
+            return matches[0].resolve()
+    else:
+        if path.is_file():
+            return path.resolve()
+        if not path.is_absolute() and (config_root / path).is_file():
+            return (config_root / path).resolve()
+    raise FileNotFoundError(
+        f"configuration {str(path)!r} not found; searched {config_root}")
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -127,7 +158,18 @@ def validate_config(cfg: dict[str, Any]) -> None:
             raise ValueError(f"chains.{old} is obsolete; use {old}_fine and {old}_coarse")
     if float(model["alpha"]) < 0:
         raise ValueError("model.alpha must be non-negative for the full Villain action")
+    if type(cfg["storage"]["save_npz"]) is not bool:
+        raise ValueError("storage.save_npz must be a boolean")
     ren = cfg["renormalization"]
+    for key, allowed in (("beta1_methods", tuple(BETA1_METHODS)),
+                         ("alpha_methods", ALPHA_METHODS)):
+        methods = ren[key]
+        if (not isinstance(methods, list) or
+                any(not isinstance(x, str) or x not in allowed for x in methods) or
+                len(set(methods)) != len(methods)):
+            raise ValueError(f"renormalization.{key} must be a unique list of {allowed}")
+    if "topo" in ren["alpha_methods"] and not ren["beta1_methods"]:
+        raise ValueError("topo requires at least one beta1 method")
     renorm_types = ren.get("type")
     if (not isinstance(renorm_types, list) or not renorm_types or
             any(value not in ("U", "z") for value in renorm_types) or
@@ -184,7 +226,7 @@ def validate_config(cfg: dict[str, Any]) -> None:
         if int(cfg["chains"].get(name, 0)) < 1:
             raise ValueError(f"chains.{name} must be positive")
     pilot = cfg["pilot"]
-    if pilot["initial_L"] > pilot["max_L"] or pilot["min_L_over_xi"] <= 0:
+    if pilot["initial_L"] > pilot["max_L"] or pilot["min_L_over_xi_G"] <= 0:
         raise ValueError("invalid pilot lattice limits")
     aggregate_sections = [("pilot", cfg["pilot"])] + [
         (name, cfg["steps"][name]) for name in ("observable", "topo")]
@@ -244,8 +286,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
             raise ValueError(f"geometry.{stem}_min/max must be -1 or at least {minimum}")
         if lo != -1 and hi != -1 and lo > hi:
             raise ValueError(f"geometry.{stem}_min must not exceed {stem}_max")
-    if geometry["padding_xi_mul"] <= 0 or geometry["obs_L_xi_mul"] <= 0:
-        raise ValueError("geometry xi multipliers must be positive")
+    if geometry["padding_xi_G_mul"] <= 0 or geometry["obs_L_xi_G_mul"] <= 0:
+        raise ValueError("geometry xi_G multipliers must be positive")
     hmc = cfg["hmc"]
     if any(hmc[key] <= 0 for key in ("epsilon", "trajectory_length", "mass_a", "mass_z",
                                      "warmup_tau_multiplier")):
@@ -255,7 +297,7 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise ValueError("diagnostics acceptance range must lie inside [0,1]")
 
 
-def resolved_geometry(cfg: dict[str, Any], xi: float) -> dict[str, int | float]:
+def resolved_geometry(cfg: dict[str, Any], xi_G: float) -> dict[str, int | float]:
     factor = int(cfg["renormalization"]["factor"])
     requested_padding = int(cfg["geometry"]["padding"])
     requested_coarse = int(cfg["geometry"]["coarse_L"])
@@ -269,12 +311,12 @@ def resolved_geometry(cfg: dict[str, Any], xi: float) -> dict[str, int | float]:
         return value
 
     padding = (requested_padding if requested_padding >= 0 else bounded(
-               int(math.ceil(cfg["geometry"]["padding_xi_mul"] * xi)), "padding"))
+               int(math.ceil(cfg["geometry"]["padding_xi_G_mul"] * xi_G)), "padding"))
     coarse = (requested_coarse if requested_coarse > 0 else bounded(
-              max(2, int(math.ceil(cfg["geometry"]["obs_L_xi_mul"] * xi / factor))),
+              max(2, int(math.ceil(cfg["geometry"]["obs_L_xi_G_mul"] * xi_G / factor))),
               "coarse_L"))
     fine = factor * coarse
-    return {"xi": float(xi), "padding": padding, "L_fine": fine,
+    return {"xi_G": float(xi_G), "padding": padding, "L_fine": fine,
             "L_coarse": fine // factor, "factor": factor}
 
 

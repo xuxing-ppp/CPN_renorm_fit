@@ -8,6 +8,8 @@ alpha1 = 0.0
 mod = [1]
 
 [renormalization]
+beta1_methods = ["magsus", "corrG"]
+alpha_methods = ["1plaq", "topo"]
 type = ["z"]
 # Linear blocking factor; this is the patch L used by legacy 1plaq/2plaq fits.
 factor = 4
@@ -31,11 +33,11 @@ topo_fine = 256
 topo_coarse = 256
 
 [pilot]
-# Pilot chains are independent PBC replicas used only to estimate xi.
+# Pilot chains are independent PBC replicas used only to estimate xi_G.
 initial_L = 32
 max_L = 128
-# Increase L until L / (xi + 2*xi_err) reaches this threshold.
-min_L_over_xi = 2.0
+# Increase L until L / (xi_G + 2*xi_G_err) reaches this threshold.
+min_L_over_xi_G = 2.5
 growth_factor = 2.0
 # Warmup and production stop adaptively between these limits.
 min_warmup = 400
@@ -47,9 +49,9 @@ max_meas_total = 50000
 
 [geometry]
 boundary_bc = "OBC"
-# Nonnegative padding overrides the xi rule; -1 uses ceil(padding_xi_mul * xi).
+# Nonnegative padding overrides the xi_G rule; -1 uses ceil(padding_xi_G_mul * xi_G).
 padding = -1
-# A value >= 2 fixes the observable coarse lattice; -1 derives it from obs_L_xi_mul.
+# A value >= 2 fixes the observable coarse lattice; -1 derives it from obs_L_xi_G_mul.
 coarse_L = -1
 # Optional bounds for automatically derived values. -1 means unbounded.
 padding_min = -1
@@ -57,8 +59,8 @@ padding_max = -1
 coarse_L_min = 20
 coarse_L_max = -1
 # These multipliers are consulted only when the corresponding override is -1.
-padding_xi_mul = 2.0
-obs_L_xi_mul = 6.0
+padding_xi_G_mul = 2.0
+obs_L_xi_G_mul = 6.0
 
 [hmc]
 # epsilon is the initial/adaptation value. trajectory_length remains fixed while
@@ -102,7 +104,7 @@ fit_confidence_sigma = 2.0
 max_fit_grid_rounds = 3
 
 [scan.alpha]
-min = 0.001
+min = 0.01
 max = 4.0
 points = []
 growth_factor = 2.0
@@ -136,8 +138,8 @@ p0 = { U = [2.0, 0.0], z = [2.0, 0.0] }
 [steps.observable]
 # Observable/topology stages do not use frozen boundaries; their measurement
 # budgets remain aggregate totals shared across chains.
-min_warmup = 1000
-max_warmup = 6000
+min_warmup = 400
+max_warmup = 8000
 min_meas_total = 100000
 target_ess = 5000
 max_meas_total = 400000
@@ -155,7 +157,11 @@ p0 = { U = 1.0, z = 1.0 }
 
 [steps.topo]
 min_warmup = 400
-max_warmup = 4000
+max_warmup = 8000
 min_meas_total = 100000
 target_ess = 5000
 max_meas_total = 400000
+
+[storage]
+# Persist raw measurement arrays; scalar JSON caches are always saved.
+save_npz = false

@@ -8,7 +8,6 @@ import torch
 
 from cpn_renorm.config import fingerprint
 from cpn_renorm.patches import (
-    PATCH_CACHE_SCHEMA,
     _adapt_inner,
     _adaptive_samples,
     _aggregate_batches,
@@ -217,7 +216,7 @@ class PatchTests(unittest.TestCase):
         self.assertEqual(ess_updates, ["20.0/5"])
 
     def test_batch_cache_reuses_matching_fingerprint(self):
-        cfg = {"runtime": {"seed": 1}}
+        cfg = {"runtime": {"seed": 1}, "storage": {"save_npz": True}}
         geometry = {"padding": 5}
         calls = []
         def generate(_cfg, _geometry, index):
@@ -238,7 +237,8 @@ class PatchTests(unittest.TestCase):
 
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
         geometry = {"padding": 5, "L_fine": 28, "L_coarse": 7, "factor": 4}
-        legacy_key = "old-schema-fingerprint"
+        cfg["storage"]["save_npz"] = True
+        legacy_key = "incompatible-fingerprint"
         with tempfile.TemporaryDirectory(dir=Path(__file__).parents[1]) as folder:
             path = Path(folder) / "batch_00000.npz"
             np.savez(path, batch_fingerprint=np.asarray(legacy_key),
@@ -257,7 +257,7 @@ class PatchTests(unittest.TestCase):
         changed = {**base, "_config_path": "elsewhere.toml", "_force": True}
         self.assertEqual(_batch_key(base, {"padding": 5}, "two_plaq", 0),
                          _batch_key(changed, {"padding": 5}, "two_plaq", 0))
-        old_key = fingerprint({"schema": PATCH_CACHE_SCHEMA - 1,
+        old_key = fingerprint({
                                "stage": "two_plaq", "batch": 0,
                                "config": {"runtime": {"seed": 1}},
                                "geometry": {"padding": 5}})

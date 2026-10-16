@@ -9,7 +9,6 @@ from .config import fingerprint
 from .storage import atomic_copy, atomic_json
 
 
-STATE_SCHEMA = 2
 STAGES = ("pilot", "two_plaq", "observable", "one_plaq", "topology")
 ACTION_RANK = {"reuse": 0, "reprocess": 1, "resimulate": 2}
 
@@ -20,11 +19,17 @@ def effective_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def config_fingerprint(cfg: dict[str, Any]) -> str:
-    return fingerprint({"schema": STATE_SCHEMA, "config": effective_config(cfg)})
+    return fingerprint(effective_config(cfg))
 
 
 def workspace_dir(cfg: dict[str, Any], output_root: str | Path) -> Path:
-    return Path(output_root).resolve() / Path(cfg["_config_path"]).stem
+    """Mirror cwd/configs categories under the output root, without .toml."""
+    source = Path(cfg["_config_path"]).resolve()
+    try:
+        relative = source.relative_to((Path.cwd() / "configs").resolve())
+    except ValueError:
+        relative = Path(source.name)
+    return Path(output_root).resolve() / relative.with_suffix("")
 
 
 def _flatten(value: Any, prefix: str = "") -> dict[str, Any]:
@@ -59,7 +64,13 @@ def affected_stages(changes: list[dict[str, Any]], *, beta1: float | None = None
     actions = {stage: "reuse" for stage in STAGES}
     for change in changes:
         path = change["path"]
-        if path == "renormalization.type":
+        if path.startswith("storage."):
+            continue
+        if path == "renormalization.beta1_methods":
+            _raise_action(actions, ("observable", "topology"), "reprocess")
+        elif path == "renormalization.alpha_methods":
+            _raise_action(actions, ("one_plaq", "topology"), "reprocess")
+        elif path == "renormalization.type":
             _raise_action(actions, ("observable", "topology"), "resimulate")
         elif path == "model.mod":
             stages = ("observable", "topology") if beta1 == 0 else STAGES
@@ -122,9 +133,9 @@ def inspect_workspace(cfg: dict[str, Any], output_root: str | Path, *,
             previous = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"cannot read workspace state {state_path}") from exc
-        if previous.get("schema") != STATE_SCHEMA:
-            # A fresh run uses the new cache/layout schema; old data stays on disk.
-            previous = {}
+        resolved_path = run_dir / "resolved.json"
+        if resolved_path.exists():
+            previous["config"] = json.loads(resolved_path.read_text(encoding="utf-8"))["config"]
     current = effective_config(cfg)
     source = str(Path(cfg["_config_path"]).resolve())
     old_config = previous.get("config")
@@ -157,11 +168,13 @@ def write_workspace_state(change: WorkspaceChange, *, command: str,
                           status: str) -> None:
     change.run_dir.mkdir(parents=True, exist_ok=True)
     atomic_json(change.run_dir / "run_state.json", {
-        "schema": STATE_SCHEMA,
         "source": change.source,
-        "config": change.config,
         "config_fingerprint": change.config_fingerprint,
         "command": command,
         "status": status,
     })
+    resolved_path = change.run_dir / "resolved.json"
+    resolved = json.loads(resolved_path.read_text()) if resolved_path.exists() else {}
+    resolved["config"] = change.config
+    atomic_json(resolved_path, resolved)
     atomic_copy(change.source, change.run_dir / "input.toml")

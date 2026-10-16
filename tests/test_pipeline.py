@@ -1,4 +1,5 @@
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,13 +11,12 @@ def load_config(path):
     cfg = _load_config(path)
     cfg["runtime"]["auto_chains"] = False
     return cfg
-from cpn_renorm.pipeline import (_censored_xi_bracket, _dynamic_fit_spacing,
+from cpn_renorm.pipeline import (_censored_xi_G_bracket, _dynamic_fit_spacing,
                                  _grid_significantly_brackets,
                                  _remove_scan_ensembles, _run_beta1_scan,
                                  _run_one_plaq, _run_topo, _run_two_plaq,
                                  _scan_decision, _uniform_fit_grid, run_pipeline)
 import numpy as np
-from cpn_renorm.workspace import config_fingerprint
 
 
 ROOT = Path(__file__).parents[1]
@@ -71,15 +71,16 @@ class PipelineWorkspaceTests(unittest.TestCase):
         self.assertEqual(one["fits"]["z"]["alpha"], 2.0)
         self.assertEqual(fit.call_count, 4)
 
-    def test_pipeline_uses_stable_workspace_and_reports_config_fingerprint(self):
+    def test_pipeline_uses_stable_workspace_and_compact_summary(self):
         cfg = load_config(ROOT / "configs" / "example.toml")
+        cfg["renormalization"]["alpha_methods"] = ["1plaq"]
         cfg["runtime"]["device"] = "cpu"
         geometry = {"padding": 5, "L_fine": 28, "L_coarse": 7, "factor": 4}
-        pilot = {"xi": 2.0, "xi_err": 0.1, "geometry": geometry}
+        pilot = {"xi_G": 2.0, "xi_G_err": 0.1, "geometry": geometry}
         step1 = {"fits": {"z": {"beta": 0.6, "alpha_eff": 0.2},
                           "U": {"beta": 0.7, "alpha_eff": 0.25}}}
         match = {"value": 0.3, "bracketed": True}
-        step2 = {"matches": {"magsus": match, "corr": match}}
+        step2 = {"matches": {"magsus": match, "corrG": match}}
         step3 = {"fits": {"z": {"alpha": 0.1}, "U": {"alpha": None}}}
 
         with tempfile.TemporaryDirectory(dir=ROOT) as folder, patch(
@@ -87,17 +88,22 @@ class PipelineWorkspaceTests(unittest.TestCase):
                 "cpn_renorm.pipeline._run_two_plaq", return_value=step1), patch(
                 "cpn_renorm.pipeline._run_beta1_scan", return_value=step2), patch(
                 "cpn_renorm.pipeline._run_one_plaq", return_value=step3):
-            summary = run_pipeline(cfg, Path(folder), skip_topo=True)
+            summary = run_pipeline(cfg, Path(folder))
             expected = Path(folder).resolve() / "example"
             self.assertEqual(run_pilot.call_args.args[1], expected)
-            self.assertEqual(summary["run_id"], "example")
-            self.assertEqual(summary["config_fingerprint"], config_fingerprint(cfg))
+            self.assertEqual(summary["model"], cfg["model"])
+            self.assertNotIn("config_fingerprint", summary)
             branch = summary["branches"]["z_mod1"]
-            self.assertIn("beta = 0.6", branch["renorm_as_fine"]["magsus_1plaq"])
-            self.assertEqual(branch["fit_points"]["beta1"]["magsus"], [])
+            self.assertEqual(branch["results"]["magsus_1plaq"]["couplings"]["beta"], 0.6)
+            self.assertEqual(branch["results"]["magsus_1plaq"]["couplings"]["alpha"], 0.1)
+            exported = tomllib.loads(branch["renorm_as_fine"]["magsus_1plaq"])
+            self.assertEqual(exported, {"beta": .6, "beta1": .3, "alpha": .1, "alpha1": .1})
+            self.assertEqual(set(branch["results"]["magsus_1plaq"]["couplings"]),
+                             {"beta", "beta1", "alpha", "alpha1", "alpha_eff"})
+            self.assertNotIn("fit_points", branch)
             self.assertTrue((expected / "input.toml").exists())
             self.assertTrue((expected / "summary.json").exists())
-            self.assertTrue((expected / "branches" / "z_mod1" / "summary.json").exists())
+            self.assertFalse((expected / "branches" / "z_mod1" / "summary.json").exists())
 
     def test_dual_type_pipeline_runs_common_stages_once_and_two_branches(self):
         cfg = load_config(ROOT / "configs" / "example.toml")
@@ -105,13 +111,13 @@ class PipelineWorkspaceTests(unittest.TestCase):
         cfg["renormalization"]["type"] = ["z", "U"]
         cfg["model"]["alpha"] = 0.2
         geometry = {"padding": 0, "L_fine": 8, "L_coarse": 2, "factor": 4}
-        pilot = {"xi": 1.0, "xi_err": 0.1, "geometry": geometry}
+        pilot = {"xi_G": 1.0, "xi_G_err": 0.1, "geometry": geometry}
         two = {"fits": {"z": {"beta": 0.6, "alpha_eff": 0.2},
                         "U": {"beta": 0.7, "alpha_eff": 0.3}}}
         one = {"fits": {"z": {"alpha": 0.1}, "U": {"alpha": 0.15}}}
         match = {"value": 0.3, "error": 0.01, "bracketed": True}
-        scan = {"matches": {"magsus": match, "corr": match}}
-        topo = {"matches": {"magsus": match, "corr": match}}
+        scan = {"matches": {"magsus": match, "corrG": match}}
+        topo = {"matches": {"magsus": match, "corrG": match}}
         with tempfile.TemporaryDirectory(dir=ROOT) as folder, patch(
                 "cpn_renorm.pipeline.run_pilot", return_value=pilot), patch(
                 "cpn_renorm.pipeline._run_two_plaq", return_value=two) as run_two, patch(
@@ -127,10 +133,10 @@ class PipelineWorkspaceTests(unittest.TestCase):
         branch_dirs = {call.args[1].name for call in run_beta.call_args_list}
         self.assertEqual(branch_dirs, {"z_mod1", "U_mod1"})
 
-    def test_undefined_xi_creates_censored_refinement_bracket(self):
+    def test_undefined_xi_G_creates_censored_refinement_bracket(self):
         xs = np.array([-1.5, -0.7, -0.3])
         ys = np.array([np.nan, 5.1, 11.2])
-        bracket = _censored_xi_bracket(xs, ys, 2.3)
+        bracket = _censored_xi_G_bracket(xs, ys, 2.3)
         self.assertEqual(bracket, [-1.5, -0.7])
         candidate, reason = _scan_decision(
             {"bracketed": False}, tolerance=0.01, max_refine=10,
@@ -175,7 +181,7 @@ class PipelineWorkspaceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "outside"):
                 _remove_scan_ensembles(run_dir, [str(run_dir / "summary.json")])
 
-    def test_beta1_scan_refines_across_undefined_xi(self):
+    def test_beta1_scan_refines_across_undefined_xi_G(self):
         cfg = load_config(ROOT / "configs" / "example.toml")
         cfg["runtime"]["device"] = "cpu"
         cfg["scan"]["beta1"].update({
@@ -186,11 +192,11 @@ class PipelineWorkspaceTests(unittest.TestCase):
 
         def fake_measure(_cfg, _run_dir, _settings, *, tag, beta1, **_kwargs):
             if tag == "obs_fine":
-                xi, magsus = 1.0, 0.8
+                xi_G, magsus = 1.0, 0.8
             else:
-                xi = None if beta1 < -1.0 else 4.0 * (beta1 + 1.0)
+                xi_G = None if beta1 < -1.0 else 4.0 * (beta1 + 1.0)
                 magsus = beta1 + 2.0
-            return {"xi": xi, "xi_err": None if xi is None else 0.02,
+            return {"xi_G": xi_G, "xi_G_err": None if xi_G is None else 0.02,
                     "magsus": magsus, "magsus_err": 0.02,
                     "mode_tau": [1.0] * 3, "mode_ess": [100.0] * 3,
                     "sampling": {"stop_reason": "target_ess"}}
@@ -206,10 +212,10 @@ class PipelineWorkspaceTests(unittest.TestCase):
             result = _run_beta1_scan(cfg, run_dir, geometry, 1.0, 0.1)
             self.assertEqual(
                 [call.args[0].name for call in plot_mock.call_args_list],
-                ["beta1_scan_magsus.png", "beta1_scan_corr.png"])
+                ["beta1_scan_magsus.png", "beta1_scan_corrG.png"])
             self.assertEqual(
                 [set(call.kwargs["series"]) for call in plot_mock.call_args_list],
-                [{"magsus_scaled"}, {"xi_scaled"}])
+                [{"magsus_scaled"}, {"xi_G_scaled"}])
             self.assertFalse(old_plot.exists())
 
             measurement_count = measure_mock.call_count
@@ -220,17 +226,17 @@ class PipelineWorkspaceTests(unittest.TestCase):
             self.assertEqual(len(plot_mock.call_args_list), 2)
             self.assertFalse(old_plot.exists())
             self.assertEqual(cached["matches"], result["matches"])
-        self.assertTrue(result["matches"]["corr"]["bracketed"])
-        self.assertAlmostEqual(result["matches"]["corr"]["value"], -0.75,
+        self.assertTrue(result["matches"]["corrG"]["bracketed"])
+        self.assertAlmostEqual(result["matches"]["corrG"]["value"], -0.75,
                                delta=0.08)
         self.assertLessEqual(
-            result["matches"]["corr"]["raw_bracket"][1] -
-            result["matches"]["corr"]["raw_bracket"][0], 0.05)
-        self.assertLessEqual(len(result["matches"]["corr"]["fit_points"]), 5)
-        grid = result["matches"]["corr"]["fit_grid"]
+            result["matches"]["corrG"]["raw_bracket"][1] -
+            result["matches"]["corrG"]["raw_bracket"][0], 0.05)
+        self.assertLessEqual(len(result["matches"]["corrG"]["fit_points"]), 5)
+        grid = result["matches"]["corrG"]["fit_grid"]
         self.assertEqual(len(grid), 5)
-        self.assertTrue(np.allclose(np.diff(grid), result["matches"]["corr"]["fit_spacing"]))
-        self.assertEqual(result["matches"]["corr"]["fit_points"], grid)
+        self.assertTrue(np.allclose(np.diff(grid), result["matches"]["corrG"]["fit_spacing"]))
+        self.assertEqual(result["matches"]["corrG"]["fit_points"], grid)
 
     def test_alpha_scan_uses_uniform_decreasing_fit_grid(self):
         cfg = load_config(ROOT / "configs" / "example.toml")
@@ -248,13 +254,13 @@ class PipelineWorkspaceTests(unittest.TestCase):
                     "sampling": {"stop_reason": "target_ess"}}
 
         beta_matches = {"magsus": {"value": -1.0, "bracketed": True},
-                        "corr": {"value": -0.8, "bracketed": True}}
+                        "corrG": {"value": -0.8, "bracketed": True}}
         with tempfile.TemporaryDirectory(dir=ROOT) as folder, patch(
                 "cpn_renorm.pipeline._measure_point", side_effect=fake_measure), patch(
                 "cpn_renorm.pipeline.isolated_plot"):
             result = _run_topo(cfg, Path(folder), geometry, 1.0, 0.2,
                                beta_matches, 0.1)
-        for method in ("magsus", "corr"):
+        for method in ("magsus", "corrG"):
             match = result["matches"][method]
             self.assertTrue(match["bracketed"])
             self.assertEqual(match["monotonic"], "decreasing")
