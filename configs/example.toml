@@ -38,7 +38,9 @@ initial_L = 32
 max_L = 128
 # Increase L until L / (xi_G + 2*xi_G_err) reaches this threshold.
 min_L_over_xi_G = 2.5
-growth_factor = 2.0
+# Next L = ceil(pilot_growth_margin * min_L_over_xi_G * (xi_G + 2*xi_G_err)),
+# capped at max_L. Margin 1 removes growth headroom without changing the pass condition.
+pilot_growth_margin = 1.25
 # Warmup and production stop adaptively between these limits.
 min_warmup = 400
 max_warmup = 4000

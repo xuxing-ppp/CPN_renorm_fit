@@ -213,8 +213,15 @@ independent chains:
 CUDA_VISIBLE_DEVICES=0 python -m cpn_renorm run configs/case.toml --device cuda:0
 ```
 
-The pilot doubles its PBC lattice until
-`L / (xi_G + 2*xi_G_err) >= min_L_over_xi_G`. It then sets
+The pilot increases its PBC lattice until
+`L / (xi_G + 2*xi_G_err) >= min_L_over_xi_G`. After a failed check, it chooses
+`L = min(max_L, ceil(pilot_growth_margin * min_L_over_xi_G * (xi_G + 2*xi_G_err)))`.
+`pilot.pilot_growth_margin` defaults to `1.25` and must be finite and at least 1;
+setting it to 1 removes growth headroom without changing the pass condition.
+`pilot.max_L` defaults to 128; reaching it without passing saves a failure record
+and stops the run. Replace the obsolete `pilot.growth_factor` setting with
+`pilot.pilot_growth_margin` when updating old configurations.
+After passing, it sets
 `padding=ceil(padding_xi_G_mul*xi_G)` and rounds `L_fine` upward to a multiple of the
 renormalization factor, with `L_coarse >= 2`. Setting `geometry.padding` or
 `geometry.coarse_L` to a valid value overrides the corresponding derived size;

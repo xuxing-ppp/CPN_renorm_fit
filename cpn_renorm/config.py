@@ -20,9 +20,9 @@ DEFAULTS: dict[str, Any] = {
     "chains": {"pilot": 16, "two_plaq": 32, "observable_fine": 16,
                "observable_coarse": 16, "one_plaq": 32,
                "topo_fine": 16, "topo_coarse": 16},
-    "pilot": {"initial_L": 16, "max_L": 256,
+    "pilot": {"initial_L": 16, "max_L": 128,
               "min_L_over_xi_G": 8.0,
-              "growth_factor": 2.0, "min_warmup": 300, "max_warmup": 4000,
+              "pilot_growth_margin": 1.25, "min_warmup": 300, "max_warmup": 4000,
               "min_meas_total": 4800, "target_ess": 200,
               "max_meas_total": 19200},
     "geometry": {"boundary_bc": "OBC", "padding": -1, "coarse_L": -1,
@@ -85,6 +85,11 @@ OBSOLETE_FIELDS = {
 def _reject_obsolete(raw: dict[str, Any], prefix: str = "") -> None:
     for key, value in raw.items():
         path = f"{prefix}.{key}" if prefix else key
+        if path == "pilot.growth_factor":
+            raise ValueError(
+                "obsolete configuration field pilot.growth_factor: "
+                "replace it with pilot.pilot_growth_margin (default 1.25); "
+                "pilot now grows from the measured correlation length")
         if key in OBSOLETE_FIELDS:
             raise ValueError(f"obsolete configuration field {path}: {OBSOLETE_FIELDS[key]}")
         if isinstance(value, dict):
@@ -228,6 +233,13 @@ def validate_config(cfg: dict[str, Any]) -> None:
     pilot = cfg["pilot"]
     if pilot["initial_L"] > pilot["max_L"] or pilot["min_L_over_xi_G"] <= 0:
         raise ValueError("invalid pilot lattice limits")
+    try:
+        growth_margin = float(pilot["pilot_growth_margin"])
+    except (TypeError, ValueError) as exc:
+        raise TypeError("pilot.pilot_growth_margin must be a number") from exc
+    if not math.isfinite(growth_margin) or growth_margin < 1:
+        raise ValueError("pilot.pilot_growth_margin must be finite and at least 1")
+    pilot["pilot_growth_margin"] = growth_margin
     aggregate_sections = [("pilot", cfg["pilot"])] + [
         (name, cfg["steps"][name]) for name in ("observable", "topo")]
     for name, settings in aggregate_sections:

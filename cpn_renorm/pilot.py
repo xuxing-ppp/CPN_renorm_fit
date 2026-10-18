@@ -138,7 +138,9 @@ def run_pilot(cfg: dict, run_dir: str | Path) -> dict:
                       "geometry": resolved_geometry(cfg, xi_G)}
             atomic_json(run_dir / "pilot" / "result.json", result)
             return result
-        new_L = min(int(p["max_L"]), int(math.ceil(L * p["growth_factor"])))
+        new_L = min(int(p["max_L"]), math.ceil(
+            float(p["pilot_growth_margin"]) * float(p["min_L_over_xi_G"])
+            * (xi_G + 2 * xi_G_err)))
         if new_L <= L:
             atomic_json(run_dir / "pilot" / "failed.json", {"attempts": attempts})
             raise RuntimeError("pilot reached max_L before finite-volume criterion passed")

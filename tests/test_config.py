@@ -2,10 +2,37 @@ from pathlib import Path
 from copy import deepcopy
 import unittest
 
-from cpn_renorm.config import load_config, resolved_geometry, section, validate_config
+from cpn_renorm.config import DEFAULTS, load_config, resolved_geometry, section, validate_config
 
 
 class ConfigTests(unittest.TestCase):
+    def test_pilot_growth_defaults_and_validation(self):
+        self.assertEqual(DEFAULTS["pilot"]["max_L"], 128)
+        self.assertEqual(DEFAULTS["pilot"]["pilot_growth_margin"], 1.25)
+        cfg = load_config(Path(__file__).parents[1] / "configs/example.toml")
+        self.assertEqual(cfg["pilot"]["max_L"], 128)
+        self.assertEqual(cfg["pilot"]["pilot_growth_margin"], 1.25)
+        for margin in (1, 1.5):
+            cfg["pilot"]["pilot_growth_margin"] = margin
+            validate_config(cfg)
+            self.assertEqual(cfg["pilot"]["pilot_growth_margin"], float(margin))
+        for margin in (0.9, float("nan"), float("inf"), -float("inf")):
+            cfg["pilot"]["pilot_growth_margin"] = margin
+            with self.subTest(margin=margin), self.assertRaisesRegex(ValueError, "finite and at least 1"):
+                validate_config(cfg)
+        for margin in (None, "invalid"):
+            cfg["pilot"]["pilot_growth_margin"] = margin
+            with self.subTest(margin=margin), self.assertRaisesRegex(TypeError, "must be a number"):
+                validate_config(cfg)
+
+    def test_old_pilot_growth_factor_is_rejected_but_scan_growth_is_valid(self):
+        cfg = load_config(Path(__file__).parents[1] / "configs/example.toml")
+        self.assertIn("growth_factor", cfg["scan"]["beta1"])
+        self.assertIn("growth_factor", cfg["scan"]["alpha"])
+        cfg["pilot"]["growth_factor"] = 2.0
+        with self.assertRaisesRegex(ValueError, "replace it with pilot.pilot_growth_margin"):
+            validate_config(cfg)
+
     def test_example_config_and_geometry(self):
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
         geo = resolved_geometry(cfg, 2.01)
