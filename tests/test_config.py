@@ -102,7 +102,21 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg["scan"]["alpha"]["refine_tolerance"], 0.002)
         self.assertEqual(cfg["scan"]["beta1"]["fit_points"], 5)
         self.assertEqual(cfg["scan"]["beta1"]["fit_spacing_min"], 0.01)
-        self.assertEqual(cfg["scan"]["alpha"]["fit_spacing_max"], 0.006)
+        self.assertEqual(DEFAULTS["scan"]["alpha"]["fit_spacing_max"], 0.006)
+
+    def test_fit_spacing_growth_defaults_overrides_and_validation(self):
+        cfg = load_config(Path(__file__).parents[1] / "configs/example.toml")
+        for kind in ("beta1", "alpha"):
+            self.assertEqual(DEFAULTS["scan"][kind]["fit_spacing_growth_factor"], 2.0)
+            self.assertEqual(cfg["scan"][kind]["fit_spacing_growth_factor"], 2.0)
+            cfg["scan"][kind]["fit_spacing_growth_factor"] = 1.5
+        validate_config(cfg)
+        for kind in ("beta1", "alpha"):
+            for value in (0, 1, -2, float("nan"), float("inf")):
+                bad = deepcopy(cfg)
+                bad["scan"][kind]["fit_spacing_growth_factor"] = value
+                with self.subTest(kind=kind, value=value), self.assertRaisesRegex(ValueError, "fit-grid"):
+                    validate_config(bad)
 
     def test_rejects_invalid_scan_refinement(self):
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")

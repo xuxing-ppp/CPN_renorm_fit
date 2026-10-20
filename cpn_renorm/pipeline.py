@@ -141,8 +141,12 @@ def _scan_points(scan: dict) -> list[float]:
 def _scan_fingerprint(kind: str, cfg: dict, geometry: dict, *, renorm_type: str,
                       **upstream: float) -> str:
     step = "observable" if kind == "beta1" else "topo"
+    scan = dict(cfg["scan"][kind])
+    # Preserve pre-option cache keys at the new default; existing fits remain valid.
+    if float(scan.get("fit_spacing_growth_factor", 2.0)) == 2.0:
+        scan.pop("fit_spacing_growth_factor", None)
     return fingerprint({"kind": kind, "geometry": geometry,
-                        "scan": cfg["scan"][kind], "settings": section(cfg, step),
+                        "scan": scan, "settings": section(cfg, step),
                         "fine_chains": cfg["chains"][f"{step}_fine"],
                         "model": cfg["model"],
                         "renormalization": {"factor": cfg["renormalization"]["factor"],
@@ -330,7 +334,7 @@ def _uniform_grid_match(*, measured: dict[float, dict], measure: Callable[[float
             proposed = _dynamic_fit_spacing(updated.get("error"), scan)
             if last_reason == "insufficient_separation":
                 proposed = max(proposed, min(float(scan["fit_spacing_max"]),
-                                             spacing * 1.5))
+                                             spacing * float(scan["fit_spacing_growth_factor"])))
             else:
                 proposed = min(proposed, spacing)
             spacing = max(float(scan["fit_spacing_min"]), proposed)

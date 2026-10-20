@@ -36,12 +36,28 @@ requires a path. Paths containing directories are checked as given first,
 then relative to `configs/`; absolute paths are also supported.
 To select a bare filename outside `configs/`, pass its absolute path.
 
+`run` accepts a single TOML file. To run all TOML files in a folder, use
+`batch` with a quoted glob pattern:
+
+```bash
+# Only TOML files directly inside this folder
+python -m cpn_renorm batch "configs/my_folder/*.toml" --output-dir runs
+
+# Include TOML files in all subfolders as well
+python -m cpn_renorm batch "configs/my_folder/**/*.toml" --output-dir runs
+```
+
+Keep the pattern in quotes so the CLI expands it. Batch patterns are relative
+to the current working directory (or absolute); include `configs/` explicitly
+when needed. Matched files run sequentially in sorted path order. An error
+stops the batch; an unmatched pattern also reports an error. The batch command
+also supports `--device`, `--seed`, `--force`, and `--accept-changes`.
+
 Outputs mirror the categories under `configs/`, dropping the `.toml` suffix:
 `configs/folder0/folder1/1.toml` writes to `runs/folder0/folder1/1/`.
 `--output-dir` replaces only the output root. External configurations still
 use `<output-root>/<filename-without-suffix>/`. This applies to batch runs
-and tuning reports as well. Batch patterns retain their existing syntax,
-for example `python -m cpn_renorm batch "configs/**/*.toml"`.
+and tuning reports as well.
 Existing flat output directories are retained but are not automatically
 migrated or reused for configurations now stored in categories.
 
@@ -170,7 +186,12 @@ bisects each raw bracket to the preliminary `refine_tolerance`. Undefined
 correlation lengths on the low-beta1 side are treated as censored values for
 bracket refinement, never as numerical zero. A preliminary bootstrap match sets
 the final uniform-grid spacing to `fit_sigma_multiplier * coupling_error`,
-clamped by `fit_spacing_min/max`. Only that odd-sized, error-separated grid is
+clamped by `fit_spacing_min/max`. If the grid fails the statistical separation
+check, `fit_spacing_growth_factor` (default `2.0`, finite and greater than 1)
+sets the minimum spacing growth for each retry, capped by `fit_spacing_max`.
+Configure it separately in `[scan.beta1]` and `[scan.alpha]`. Existing cached
+results remain reusable at the default; new fits use the new growth factor.
+Only that odd-sized, error-separated grid is
 used by the final inverse-variance-weighted monotonic polynomial. Explicit scan
 points select the initial samples; automatic expansion, localization, and final
 grid construction still follow.

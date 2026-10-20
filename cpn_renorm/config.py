@@ -39,12 +39,14 @@ DEFAULTS: dict[str, Any] = {
                          "growth_factor": 2.0, "max_rounds": 7,
                          "refine_tolerance": 0.02, "max_refine_rounds": 10,
                          "fit_points": 5, "fit_sigma_multiplier": 3.0,
+                         "fit_spacing_growth_factor": 2.0,
                          "fit_spacing_min": 0.01, "fit_spacing_max": 0.05,
                          "fit_confidence_sigma": 2.0, "max_fit_grid_rounds": 3},
              "alpha": {"min": 0.001, "max": 8.0,
                        "growth_factor": 2.0, "max_rounds": 7,
                        "refine_tolerance": 0.002, "max_refine_rounds": 10,
                        "fit_points": 5, "fit_sigma_multiplier": 3.0,
+                       "fit_spacing_growth_factor": 2.0,
                        "fit_spacing_min": 0.0015, "fit_spacing_max": 0.006,
                        "fit_confidence_sigma": 2.0, "max_fit_grid_rounds": 3}},
     "steps": {
@@ -218,7 +220,9 @@ def validate_config(cfg: dict[str, Any]) -> None:
             raise ValueError(f"scan.{name} refinement settings are invalid")
         spacing_min = float(scan["fit_spacing_min"])
         spacing_max = float(scan["fit_spacing_max"])
-        if (spacing_min <= 0 or spacing_max < spacing_min or
+        spacing_growth = float(scan["fit_spacing_growth_factor"])
+        if (not math.isfinite(spacing_growth) or spacing_growth <= 1 or
+                spacing_min <= 0 or spacing_max < spacing_min or
                 float(scan["fit_sigma_multiplier"]) <= 0 or
                 float(scan["fit_confidence_sigma"]) <= 0 or
                 int(scan["max_fit_grid_rounds"]) < 0 or

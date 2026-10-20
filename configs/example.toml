@@ -100,8 +100,10 @@ max_refine_rounds = 10
 # Build an odd, uniform final grid from the preliminary bootstrap coupling error.
 fit_points = 5
 fit_sigma_multiplier = 3.0
+# Widen spacing after insufficient separation, capped by fit_spacing_max.
+fit_spacing_growth_factor = 2.0
 fit_spacing_min = 0.01
-fit_spacing_max = 0.05
+fit_spacing_max = 0.1
 fit_confidence_sigma = 2.0
 max_fit_grid_rounds = 3
 
@@ -115,8 +117,10 @@ refine_tolerance = 0.002
 max_refine_rounds = 10
 fit_points = 5
 fit_sigma_multiplier = 3.0
-fit_spacing_min = 0.0015
-fit_spacing_max = 0.006
+# Widen spacing after insufficient separation, capped by fit_spacing_max.
+fit_spacing_growth_factor = 2.0
+fit_spacing_min = 0.001
+fit_spacing_max = 0.01
 fit_confidence_sigma = 2.0
 max_fit_grid_rounds = 3
 

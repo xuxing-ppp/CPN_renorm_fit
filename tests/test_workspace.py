@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from cpn_renorm.cli import _approve_changes, _parser
 from cpn_renorm.config import load_config
-from cpn_renorm.workspace import (affected_stages, inspect_workspace,
+from cpn_renorm.workspace import (_changes, affected_stages, inspect_workspace,
                                   workspace_dir, write_workspace_state)
 
 
@@ -14,6 +14,16 @@ ROOT = Path(__file__).parents[1]
 
 
 class WorkspaceTests(unittest.TestCase):
+    def test_default_fit_spacing_growth_does_not_change_old_workspace(self):
+        old = {"scan": {"beta1": {}, "alpha": {}}}
+        new = deepcopy(old)
+        for kind in ("beta1", "alpha"):
+            new["scan"][kind]["fit_spacing_growth_factor"] = 2.0
+        self.assertEqual(_changes(old, new), [])
+        new["scan"]["alpha"]["fit_spacing_growth_factor"] = 3.0
+        self.assertEqual([item["path"] for item in _changes(old, new)],
+                         ["scan.alpha.fit_spacing_growth_factor"])
+
     def test_commands_accept_noninteractive_change_flag(self):
         for command in ("pilot", "run", "tune-chains"):
             with self.subTest(command=command):

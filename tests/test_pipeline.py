@@ -15,7 +15,8 @@ from cpn_renorm.pipeline import (_censored_xi_G_bracket, _dynamic_fit_spacing,
                                  _grid_significantly_brackets,
                                  _remove_scan_ensembles, _run_beta1_scan,
                                  _run_one_plaq, _run_topo, _run_two_plaq,
-                                 _scan_decision, _uniform_fit_grid, run_pipeline)
+                                 _scan_decision, _scan_fingerprint, _uniform_fit_grid,
+                                 _uniform_grid_match, run_pipeline)
 import numpy as np
 
 
@@ -144,12 +145,52 @@ class PipelineWorkspaceTests(unittest.TestCase):
         self.assertAlmostEqual(candidate, -1.1)
         self.assertEqual(reason, "refine")
 
+    def test_fit_spacing_growth_preserves_legacy_cache_keys_at_default(self):
+        cfg = load_config(ROOT / "configs/example.toml")
+        for kind in ("beta1", "alpha"):
+            scan = cfg["scan"][kind]
+            scan.pop("fit_spacing_growth_factor")
+            legacy = _scan_fingerprint(kind, cfg, {}, renorm_type="z")
+            scan["fit_spacing_growth_factor"] = 2.0
+            self.assertEqual(_scan_fingerprint(kind, cfg, {}, renorm_type="z"), legacy)
+            scan["fit_spacing_growth_factor"] = 3.0
+            self.assertNotEqual(_scan_fingerprint(kind, cfg, {}, renorm_type="z"), legacy)
+
+    def test_uniform_grid_retries_use_configured_growth_and_cap(self):
+        cfg = load_config(ROOT / "configs/example.toml")
+        for kind in ("beta1", "alpha"):
+            for factor in (1.5, 2.0, 3.0):
+                scan = dict(cfg["scan"][kind])
+                scan.update(min=-1., max=1., fit_spacing_min=0.01,
+                            fit_spacing_max=0.05, fit_spacing_growth_factor=factor,
+                            max_fit_grid_rounds=3)
+                grids = []
+
+                def reject(values, *_args):
+                    grids.append(values.copy())
+                    return False, "insufficient_separation"
+
+                with patch("cpn_renorm.pipeline.isolated_match", return_value={
+                        "bracketed": True, "value": 0., "error": 0.}), patch(
+                        "cpn_renorm.pipeline._grid_significantly_brackets", side_effect=reject):
+                    result = _uniform_grid_match(
+                        measured={0.: {"value": 0.}},
+                        measure=lambda x: {"value": x},
+                        observable=lambda d: (d["value"], 0.01),
+                        target=0., target_err=0.01, increasing=True,
+                        scan=scan, bootstrap_seed=1)
+                with self.subTest(kind=kind, factor=factor):
+                    self.assertIsNone(result["value"])
+                    self.assertEqual(len(grids), 4)
+                    for index, grid in enumerate(grids):
+                        self.assertTrue(np.allclose(np.diff(grid), min(0.01 * factor**index, 0.05)))
+
     def test_dynamic_spacing_and_uniform_grid_respect_bounds(self):
         cfg = load_config(ROOT / "configs" / "example.toml")
         scan = cfg["scan"]["beta1"]
         self.assertEqual(_dynamic_fit_spacing(None, scan), 0.01)
         self.assertAlmostEqual(_dynamic_fit_spacing(0.01, scan), 0.03)
-        self.assertEqual(_dynamic_fit_spacing(1.0, scan), 0.05)
+        self.assertEqual(_dynamic_fit_spacing(1.0, scan), scan["fit_spacing_max"])
         grid = _uniform_fit_grid(-7.99, 0.03, scan)
         self.assertEqual(len(grid), 5)
         self.assertGreaterEqual(grid[0], scan["min"])

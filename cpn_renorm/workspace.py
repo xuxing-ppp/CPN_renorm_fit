@@ -44,6 +44,11 @@ def _flatten(value: Any, prefix: str = "") -> dict[str, Any]:
 
 def _changes(old: dict[str, Any], new: dict[str, Any]) -> list[dict[str, Any]]:
     before, after = _flatten(old), _flatten(new)
+    # Introducing the default retry factor must not flag existing workspaces.
+    for kind in ("beta1", "alpha"):
+        key = f"scan.{kind}.fit_spacing_growth_factor"
+        before.setdefault(key, 2.0)
+        after.setdefault(key, 2.0)
     missing = "<missing>"
     return [
         {"path": path, "old": before.get(path, missing),
