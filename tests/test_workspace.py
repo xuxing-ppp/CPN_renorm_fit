@@ -24,6 +24,19 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual([item["path"] for item in _changes(old, new)],
                          ["scan.alpha.fit_spacing_growth_factor"])
 
+    def test_alpha_topo_fit_change_only_affects_topology(self):
+        changes = [{'path': 'renormalization.alpha_topo_fit', 'old': True, 'new': False}]
+        actions = affected_stages(changes)
+        self.assertEqual(actions.pop('topology'), 'reprocess')
+        self.assertTrue(all(action == 'reuse' for action in actions.values()))
+        old = {'renormalization': {'beta1_methods': ['corrG']}}
+        new = deepcopy(old)
+        new['renormalization']['alpha_topo_fit'] = True
+        self.assertEqual(_changes(old, new), [])
+        new['renormalization']['alpha_topo_fit'] = False
+        self.assertEqual([change['path'] for change in _changes(old, new)],
+                         ['renormalization.alpha_topo_fit'])
+
     def test_commands_accept_noninteractive_change_flag(self):
         for command in ("pilot", "run", "tune-chains"):
             with self.subTest(command=command):
@@ -56,8 +69,8 @@ class WorkspaceTests(unittest.TestCase):
         actions = affected_stages(changes)
         self.assertEqual(actions["one_plaq"], "resimulate")
         self.assertEqual(actions["topology"], "resimulate")
-        self.assertEqual(actions["two_plaq"], "reuse")
-        self.assertEqual(actions["observable"], "reuse")
+        self.assertEqual(actions["two_plaq"], "resimulate")
+        self.assertEqual(actions["observable"], "resimulate")
 
     def test_workspace_tracks_effective_config_and_source(self):
         cfg = load_config(ROOT / "configs" / "example.toml")

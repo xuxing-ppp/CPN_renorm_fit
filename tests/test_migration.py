@@ -40,7 +40,7 @@ class MigrationTests(unittest.TestCase):
         atomic_json(root / "summary.json", summary)
         atomic_json(branch / "summary.json", summary["branches"]["z_mod1"])
         cfg.pop("storage")
-        cfg["renormalization"].pop("alpha_methods")
+        cfg["renormalization"].pop("alpha_methods", None)
         cfg["renormalization"].pop("beta1_methods")
         atomic_json(root / "run_state.json", {"schema": 2, "config": cfg,
                     "source": str(ROOT / "configs/example.toml"), "command": "run", "status": "complete"})
@@ -94,11 +94,11 @@ class MigrationTests(unittest.TestCase):
             cfg = read_json(root / "resolved.json")["config"]
             scalar = mod_config(cfg, 1)
             branch = root / "branches/z_mod1"
-            with patch("cpn_renorm.pipeline._measure_point", side_effect=AssertionError("resampling")), patch(
+            # Folded legacy observables cannot serve the full-action pipeline.
+            with patch("cpn_renorm.pipeline._measure_point", side_effect=RuntimeError("resampling required")), patch(
                     "cpn_renorm.pipeline._plot_beta1_scan"):
-                obs = _run_beta1_scan(scalar, branch, geometry, .6, .2)
-                topo = _run_topo(scalar, branch, geometry, .6, .2, obs["matches"])
-            self.assertEqual(topo["matches"]["corrG"]["value"], .3)
+                with self.assertRaisesRegex(RuntimeError, "resampling required"):
+                    _run_beta1_scan(scalar, branch, geometry, .6, .2, alpha_c=.1)
             snapshot = {p.relative_to(root): p.read_bytes() for p in root.rglob("*.json")}
             migrate_run(root)
             self.assertEqual(snapshot, {p.relative_to(root): p.read_bytes() for p in root.rglob("*.json")})

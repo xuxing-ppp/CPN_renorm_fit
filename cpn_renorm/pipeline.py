@@ -34,6 +34,8 @@ def _renorm_types(cfg: dict) -> list[str]:
 def _point_sampler(cfg: dict, settings: dict, *, L: int, beta: float, beta1: float,
                    alpha: float, alpha1: float, kind: str, seed: int) -> BatchedHMCSampler:
     rt, m = cfg["runtime"], cfg["model"]
+    if kind == "full" and alpha == 0:
+        kind, alpha, alpha1 = "half", alpha1, 0.0
     return BatchedHMCSampler(
         chains=int(settings["chains"]), Lx=L, Ly=L, N=int(m["N"]),
         couplings=Couplings(beta, beta1, alpha, alpha1, int(m["mod"])),
@@ -71,7 +73,7 @@ def _measure_point(cfg: dict, run_dir: Path, settings: dict, *, tag: str, L: int
     lattice = "fine" if "_fine" in tag else "coarse"
     settings = {**settings, "chains": cfg["chains"][f"{stage}_{lattice}"]}
     key_name = f"{stage}_{lattice}"
-    requested = {"tag": tag, "L": L, "beta": beta, "beta1": beta1,
+    requested = {"sampling_revision": 3, "tag": tag, "L": L, "beta": beta, "beta1": beta1,
                  "alpha": alpha, "alpha1": alpha1, "kind": kind,
                  "N": cfg["model"]["N"], "mod": cfg["model"]["mod"],
                  "settings": settings, "runtime": cfg["runtime"]}
@@ -92,7 +94,7 @@ def _measure_point(cfg: dict, run_dir: Path, settings: dict, *, tag: str, L: int
                             settings_name=stage)
         settings["chains"] = tune_stage(cfg, key_name, [workload])
         cfg["_tuned_measurements"].add(key_name)
-    payload = {"tag": tag, "L": L, "beta": beta, "beta1": beta1,
+    payload = {"sampling_revision": 3, "tag": tag, "L": L, "beta": beta, "beta1": beta1,
                "alpha": alpha, "alpha1": alpha1, "kind": kind,
                "N": cfg["model"]["N"], "mod": cfg["model"]["mod"],
                "settings": settings, "runtime": cfg["runtime"]}
@@ -145,7 +147,7 @@ def _scan_fingerprint(kind: str, cfg: dict, geometry: dict, *, renorm_type: str,
     # Preserve pre-option cache keys at the new default; existing fits remain valid.
     if float(scan.get("fit_spacing_growth_factor", 2.0)) == 2.0:
         scan.pop("fit_spacing_growth_factor", None)
-    return fingerprint({"kind": kind, "geometry": geometry,
+    return fingerprint({"pipeline_revision": 3, "kind": kind, "geometry": geometry,
                         "scan": scan, "settings": section(cfg, step),
                         "fine_chains": cfg["chains"][f"{step}_fine"],
                         "model": cfg["model"],
@@ -357,24 +359,45 @@ def _uniform_grid_match(*, measured: dict[float, dict], measure: Callable[[float
             "grid_validation": last_reason}
 
 
-def _run_two_plaq(cfg: dict, run_dir: Path, geometry: dict) -> dict:
-    result_path = run_dir / "step1_2plaq" / "result.json"
-    result_key = patch_result_key(cfg, geometry, "two_plaq")
+def _one_fit_key(cfg: dict, geometry: dict) -> str:
+    return fingerprint({"raw": patch_result_key(cfg, geometry, "one_plaq"), "algorithm": 3,
+                              "types": _renorm_types(cfg), "device": str(resolve_device(cfg["runtime"]["device"]))})
+
+
+def _two_fit_key(cfg: dict, geometry: dict, one_plaq: dict) -> str:
+    return fingerprint({"raw": patch_result_key(cfg, geometry, "two_plaq"),
+                              "fixed_alpha": one_plaq["fits"], "algorithm": 3,
+                              "device": str(resolve_device(cfg["runtime"]["device"]))})
+
+
+def _run_two_plaq(cfg: dict, run_dir: Path, geometry: dict, one_plaq: dict) -> dict:
+    result_path = run_dir / "step2_2plaq" / "result.json"
+    result_key = _two_fit_key(cfg, geometry, one_plaq)
     if result_path.exists() and not cfg.get("_force"):
         cached = json.loads(result_path.read_text(encoding="utf-8"))
         if cached.get("fingerprint") == result_key:
-            _log("reuse completed step 1 (2plaq)")
+            _log("reuse completed step 2 (2plaq)")
             return cached
-    _log("step 1/4: 2plaq fit")
-    batch_dir = run_dir / "step1_2plaq" / "batches"
+    _log("step 2/4: 2plaq old/new fits")
+    batch_dir = run_dir / "step2_2plaq" / "batches"
     raw = generate_two_plaq(cfg, geometry, batch_dir)
     p0 = cfg["steps"]["two_plaq"]["p0"]
-    fits = {tag: isolated_fit(
-        "two_plaq", {"N": int(cfg["model"]["N"]), "p0": p0[tag]},
-        X=raw[f"X_{tag}"], freq=raw[f"freq_{tag}"])
-        for tag in ("U", "z")}
+    fits = {}
+    for tag in _renorm_types(cfg):
+        fixed = one_plaq["fits"][tag]
+        fits[tag] = isolated_fit("two_fixed", {
+            "N": int(cfg["model"]["N"]), "p0": p0[tag], "alpha": fixed["alpha"],
+            "device": str(resolve_device(cfg["runtime"]["device"]))},
+            X=raw[f"X_{tag}"], freq=raw[f"freq_{tag}"])
+        fits[tag]["new"].update(alpha_source=fixed.get("source", "1plaq"),
+                                  fixed_alpha_error=fixed.get("alpha_err"))
+    atomic_json(run_dir / "step2_2plaq" / "fit.log", fits)
+    cfg["_two_raw"] = raw
+    measurement_path = run_dir / "step2_2plaq" / "measurements.npz"
     if cfg["storage"]["save_npz"]:
-        atomic_npz(run_dir / "step1_2plaq" / "measurements.npz", **raw)
+        atomic_npz(measurement_path, **raw)
+    elif measurement_path.exists():
+        measurement_path.unlink()
     stop_reasons = np.asarray(raw["sampling_stop_reason"]).astype(str)
     warmup_reasons = np.asarray(raw["warmup_stop_reason"]).astype(str)
     outer_warmup_reasons = np.asarray(raw["outer_warmup_stop_reason"]).astype(str)
@@ -428,14 +451,14 @@ def _plot_beta1_scan(run_dir: Path, scale_factor: int, fine: dict,
         if method not in matches:
             continue
         label = "magsus_scaled" if method == "magsus" else "xi_G_scaled"
-        isolated_plot(run_dir / "step2_observable" / f"beta1_scan_{method}.png", x=xs,
+        isolated_plot(run_dir / "step3_observable" / f"beta1_scan_{method}.png", x=xs,
             series={label: np.array([float(measured[x][field]) * scale
                 if measured[x].get(field) is not None else np.nan for x in xs])},
             errors={label: np.array([float(measured[x][field + "_err"]) * scale
                 if measured[x].get(field + "_err") is not None else np.nan for x in xs])},
             matches={label: matches[method]}, targets={f"fine_{field}": fine[field]},
             xlabel="beta1", ylabel=field)
-    old_plot = run_dir / "step2_observable" / "beta1_scan.png"
+    old_plot = run_dir / "step3_observable" / "beta1_scan.png"
     if old_plot.exists():
         old_plot.unlink()
 
@@ -515,24 +538,24 @@ def _retain_scan(directory: Path, measured: dict, phases: dict, *, tag: str) -> 
 
 
 def _run_beta1_scan(cfg: dict, run_dir: Path, geometry: dict,
-                    beta_c: float, alpha_eff_c: float,
-                    renorm_type: str | None = None) -> dict:
+                    beta_c: float, alpha1_c: float,
+                    renorm_type: str | None = None, *, alpha_c: float = 0.0) -> dict:
     methods = cfg["renormalization"]["beta1_methods"]
     if not methods:
         return {"matches": {}}
     settings, scan = section(cfg, "observable"), cfg["scan"]["beta1"]
     m, R = cfg["model"], geometry["factor"]
     renorm_type = renorm_type or _renorm_types(cfg)[0]
-    path = run_dir / "step2_observable" / "result.json"
+    path = run_dir / "step3_observable" / "result.json"
     cached = read_json(path) if path.exists() and not cfg.get("_force") else {}
     keys = {name: _method_key(cfg, geometry, method=name, kind="beta1",
                               renorm_type=renorm_type, beta_c=beta_c,
-                              alpha_eff_c=alpha_eff_c) for name in methods}
+                              alpha1_c=alpha1_c, alpha_c=alpha_c) for name in methods}
     measured, phases = scan_measurements(run_dir, cached)
     # Measurement parameters can change independently of method selection.
     compatible = cached.get("measurement_key") == _scan_fingerprint(
         "beta1", cfg, geometry, renorm_type=renorm_type,
-        beta_c=beta_c, alpha_eff_c=alpha_eff_c)
+        beta_c=beta_c, alpha1_c=alpha1_c, alpha_c=alpha_c)
     if not compatible:
         measured, phases = {}, {}
     matches = dict(cached.get("matches", {})) if compatible else {}
@@ -541,12 +564,12 @@ def _run_beta1_scan(cfg: dict, run_dir: Path, geometry: dict,
     fine = load_point(fine_path.parent) if compatible and fine_path.is_file() else _measure_point(
         cfg, run_dir, settings, tag="obs_fine", L=geometry["L_fine"],
         beta=float(m["beta"]), beta1=float(m["beta1"]),
-        alpha=float(m["alpha"] + m["alpha1"]), alpha1=0.0, kind="half")
+        alpha=float(m["alpha"]), alpha1=float(m["alpha1"]), kind="full")
 
     def measure(value: float) -> dict:
         return _measure_point(cfg, run_dir, settings, tag="obs_coarse",
                               L=geometry["L_coarse"], beta=beta_c, beta1=value,
-                              alpha=alpha_eff_c, alpha1=0.0, kind="half")
+                              alpha=alpha_c, alpha1=alpha1_c, kind="full")
 
     for name in methods:
         if fingerprints.get(name) == keys[name] and name in matches:
@@ -564,12 +587,12 @@ def _run_beta1_scan(cfg: dict, run_dir: Path, geometry: dict,
             initial=_scan_points(scan), increasing=descriptor["increasing"],
             seed=descriptor["seed"], censored_xi_G=field == "xi_G")
         fingerprints[name] = _method_key(cfg, geometry, method=name, kind="beta1",
-            renorm_type=renorm_type, beta_c=beta_c, alpha_eff_c=alpha_eff_c)
+            renorm_type=renorm_type, beta_c=beta_c, alpha1_c=alpha1_c, alpha_c=alpha_c)
     entries, cleanup = _retain_scan(run_dir, measured, phases, tag="obs_coarse")
     fine_entries = write_scan_points(run_dir, {0.0: fine}, {0.0: {"reference"}}, tag="obs_fine")
     result = {"step": "observable_beta1", "measurement_key": _scan_fingerprint(
         "beta1", cfg, geometry, renorm_type=renorm_type, beta_c=beta_c,
-        alpha_eff_c=alpha_eff_c), "fine_path": fine_entries["0.0"]["path"],
+        alpha1_c=alpha1_c, alpha_c=alpha_c), "fine_path": fine_entries["0.0"]["path"],
         "measurements": entries, "matches": matches, "method_fingerprints": fingerprints}
     atomic_json(path, result)
     selected = {name: matches[name] for name in methods}
@@ -578,27 +601,34 @@ def _run_beta1_scan(cfg: dict, run_dir: Path, geometry: dict,
 
 
 def _run_one_plaq(cfg: dict, run_dir: Path, geometry: dict) -> dict:
-    result_path = run_dir / "step3a_1plaq" / "result.json"
-    result_key = patch_result_key(cfg, geometry, "one_plaq")
+    result_path = run_dir / "step1_1plaq" / "result.json"
+    result_key = _one_fit_key(cfg, geometry)
     if result_path.exists() and not cfg.get("_force"):
         cached = json.loads(result_path.read_text(encoding="utf-8"))
         if cached.get("fingerprint") == result_key:
-            _log("reuse completed step 3a (1plaq)")
+            _log("reuse completed step 1 (1plaq)")
             return cached
-    _log("step 3a/4: 1plaq alpha fit")
-    batch_dir = run_dir / "step3a_1plaq" / "batches"
+    _log("step 1/4: 1plaq alpha fit")
+    batch_dir = run_dir / "step1_1plaq" / "batches"
+    if _renorm_types(cfg) == ["U"] and float(cfg["model"]["alpha"]) == 0.0:
+        result = {"step": "one_plaq", "fingerprint": result_key, "fits": {
+            "U": {"alpha": 0.0, "alpha_err": None, "source": "alpha_zero_subspace_convention"}}}
+        atomic_json(result_path, result)
+        return result
     raw = generate_one_plaq(cfg, geometry, batch_dir)
     p0 = cfg["steps"]["one_plaq"]["p0"]
-    fits = {"z": isolated_fit("one_plaq", {"p0": float(p0["z"])},
-                               X=raw["X_z"], freq=raw["freq_z"])}
-    if abs(float(cfg["model"]["alpha"])) < 1e-12:
-        fits["U"] = {"alpha": None,
-                     "reason": "fine s sector is unconstrained when model.alpha=0"}
-    else:
-        fits["U"] = isolated_fit("one_plaq", {"p0": float(p0["U"])},
-                                  X=raw["X_s"], freq=raw["freq_s"])
+    fits = {}
+    for tag in _renorm_types(cfg):
+        if tag == "U" and float(cfg["model"]["alpha"]) == 0.0:
+            fits[tag] = {"alpha": 0.0, "alpha_err": None, "source": "alpha_zero_subspace_convention"}
+        else:
+            fits[tag] = isolated_fit("one_plaq", {"p0": float(p0[tag]),
+                "device": str(resolve_device(cfg["runtime"]["device"]))},
+                X=raw["X_s" if tag == "U" else "X_z"], freq=raw["freq_s" if tag == "U" else "freq_z"])
+            fits[tag]["source"] = "1plaq"
+    atomic_json(run_dir / "step1_1plaq" / "fit.log", fits)
     if cfg["storage"]["save_npz"]:
-        atomic_npz(run_dir / "step3a_1plaq" / "measurements.npz", **raw)
+        atomic_npz(run_dir / "step1_1plaq" / "measurements.npz", **raw)
     stop_reasons = np.asarray(raw["sampling_stop_reason"]).astype(str)
     warmup_reasons = np.asarray(raw["warmup_stop_reason"]).astype(str)
     outer_warmup_reasons = np.asarray(raw["outer_warmup_stop_reason"]).astype(str)
@@ -646,23 +676,28 @@ def _run_one_plaq(cfg: dict, run_dir: Path, geometry: dict) -> dict:
 
 
 def _default_alpha_points(center: float, scan: dict) -> list[float]:
+    lo, hi = float(scan["min"]), float(scan["max"])
+    if not lo <= center <= hi:
+        raise ValueError(f"1plaq alpha center {center} outside scan range [{lo}, {hi}]")
     if scan.get("points"):
         return _scan_points(scan)
-    lo, hi = float(scan["min"]), float(scan["max"])
-    spacing = min(0.1, (hi - lo) / 2)
-    return [lo + i * spacing for i in range(3)]
+    spacing = max(float(scan["refine_tolerance"]), float(scan["fit_spacing_min"]))
+    return sorted(set([max(lo, center-spacing), center, min(hi, center+spacing)]))
 
 
 def _run_topo(cfg: dict, run_dir: Path, geometry: dict, beta_c: float,
-              alpha_eff_c: float, beta1_matches: dict, alpha_1plaq: float | None = None,
+              alpha1_c: float, beta1_matches: dict, alpha_1plaq: float | None = None,
               renorm_type: str | None = None) -> dict:
     methods = cfg["renormalization"]["beta1_methods"]
     settings, scan = section(cfg, "topo"), cfg["scan"]["alpha"]
+    if alpha_1plaq is None:
+        raise ValueError("topo requires an independently estimated 1plaq alpha center")
+    initial_points = _default_alpha_points(float(alpha_1plaq), scan)
     m, R = cfg["model"], geometry["factor"]
     renorm_type = renorm_type or _renorm_types(cfg)[0]
-    path = run_dir / "step3b_topo" / "result.json"
+    path = run_dir / "step4_topo" / "result.json"
     cached = read_json(path) if path.exists() and not cfg.get("_force") else {}
-    fine_kind = "full" if renorm_type == "U" or abs(float(m["alpha"])) > 1e-12 else "half"
+    fine_kind = "full"
     component = "Q_s" if renorm_type == "U" else "Q_z"
     fine_parameters = dict(tag="topo_fine", L=geometry["L_fine"],
         beta=float(m["beta"]), beta1=float(m["beta1"]), kind=fine_kind,
@@ -681,13 +716,15 @@ def _run_topo(cfg: dict, run_dir: Path, geometry: dict, beta_c: float,
     for name in methods:
         beta_match = beta1_matches[name]
         if not beta_match.get("bracketed"):
-            matches[name] = {"value": None, "error": None, "reason": "beta1 was not bracketed"}
+            matches[name] = {"value": None, "error": None, "reason": "beta1 was not bracketed",
+                             "alpha_before": alpha_1plaq, "alpha_after": alpha_1plaq,
+                             "alpha_correction": 0.0, "correction_success": False}
             fingerprints.pop(name, None)
             continue
         beta1_c = float(beta_match["value"])
         key = _method_key(cfg, geometry, method=name, kind="alpha",
                           renorm_type=renorm_type, beta_c=beta_c,
-                          alpha_eff_c=alpha_eff_c, beta1_c=beta1_c)
+                          alpha1_c=alpha1_c, alpha_c=alpha_1plaq, beta1_c=beta1_c)
         if fingerprints.get(name) == key and name in matches:
             continue
         previous = matches.get(name, {}) if fingerprints.get(name) == key else {}
@@ -696,24 +733,28 @@ def _run_topo(cfg: dict, run_dir: Path, geometry: dict, beta_c: float,
         def measure(value: float) -> dict:
             return _measure_point(cfg, run_dir, settings, tag=f"topo_coarse_{name}",
                 L=geometry["L_coarse"], beta=beta_c, beta1=beta1_c, alpha=value,
-                alpha1=alpha_eff_c - value, kind="full")
+                alpha1=alpha1_c, kind="full")
 
         def observable(result: dict) -> tuple[float, float]:
             t = result["topology"]["Q_s"]
             return float(t["topo_sus"]), float(t["err"])
 
         match = _search_fit(cfg, scan, measured, phases, measure, observable,
-            target, target_err, initial=_default_alpha_points(0.0, scan),
+            target, target_err, initial=initial_points,
             increasing=False, seed=int(BETA1_METHODS[name]["seed"]) + 100)
         entries, unused = _retain_scan(run_dir, measured, phases, tag=f"topo_coarse_{name}")
         cleanup.extend(unused)
-        match.update(beta1_c=beta1_c, measurements=entries)
+        match.update(beta1_c=beta1_c, measurements=entries,
+                     alpha_before=alpha_1plaq,
+                     alpha_after=match.get("value") if match.get("bracketed") else alpha_1plaq,
+                     alpha_correction=(float(match["value"])-alpha_1plaq) if match.get("bracketed") else 0.0,
+                     correction_success=bool(match.get("bracketed")))
         matches[name] = match
         fingerprints[name] = _method_key(cfg, geometry, method=name, kind="alpha",
-            renorm_type=renorm_type, beta_c=beta_c, alpha_eff_c=alpha_eff_c,
+            renorm_type=renorm_type, beta_c=beta_c, alpha1_c=alpha1_c, alpha_c=alpha_1plaq,
             beta1_c=beta1_c)
         xs = np.array(sorted(measured))
-        isolated_plot(run_dir / "step3b_topo" / f"alpha_scan_{name}.png", x=xs,
+        isolated_plot(run_dir / "step4_topo" / f"alpha_scan_{name}.png", x=xs,
             series={"topo_sus_Qs": np.array([observable(measured[x])[0] for x in xs])},
             errors={"topo_sus_Qs": np.array([observable(measured[x])[1] for x in xs])},
             matches={"topo_sus_Qs": match}, targets={f"fine_{component}_scaled": target},
@@ -734,36 +775,33 @@ def _run_topo(cfg: dict, run_dir: Path, geometry: dict, beta_c: float,
 
 
 def _branch_summary(cfg: dict, run_name: str, renorm_type: str, geometry: dict,
-                    beta_c: float, alpha_eff_c: float, alpha_1: float | None,
+                    beta_c: float, alpha1_c: float, alpha_1: float,
                     step2: dict, topo: dict, *, fit2: dict | None = None,
                     fit1: dict | None = None) -> dict:
-    """Keep complete coupling combinations and their errors together."""
     fit2, fit1 = fit2 or {}, fit1 or {}
-    beta_methods = cfg["renormalization"]["beta1_methods"]
-    alpha_methods = cfg["renormalization"]["alpha_methods"]
     results, fragments = {}, {}
-    for beta_method in beta_methods or [None]:
-        beta_match = step2.get("matches", {}).get(beta_method, {})
-        for alpha_method in alpha_methods or [None]:
-            if alpha_method == "1plaq":
-                alpha, alpha_err = alpha_1, fit1.get("alpha_err")
-            elif alpha_method == "topo":
-                match = topo.get("matches", {}).get(beta_method, {})
-                alpha, alpha_err = match.get("value"), match.get("error")
-            else:
-                alpha = alpha_err = None
-            name = (f"{beta_method}_obs_fit_topo" if alpha_method == "topo" else
-                    "_".join(x for x in (beta_method, alpha_method) if x) or "unfitted")
-            couplings = {"beta": beta_c, "beta1": beta_match.get("value"),
-                         "alpha": alpha,
-                         "alpha1": alpha_eff_c - alpha if alpha is not None else None,
-                         "alpha_eff": alpha_eff_c}
-            errors = {"beta": fit2.get("beta_err"), "beta1": beta_match.get("error"),
-                      "alpha": alpha_err, "alpha_eff": fit2.get("alpha_eff_err")}
-            results[name] = {"couplings": couplings, "errors": errors}
-            if all(couplings[key] is not None for key in ("beta", "beta1", "alpha", "alpha1")):
-                fragments[name] = "\n".join(f"{key} = {couplings[key]!r}"
-                                            for key in ("beta", "beta1", "alpha", "alpha1"))
+    for method in cfg["renormalization"]["beta1_methods"] or [None]:
+        beta_match = step2.get("matches", {}).get(method, {})
+        baseline = {"beta": beta_c, "beta1": beta_match.get("value"),
+                    "alpha": alpha_1, "alpha1": alpha1_c}
+        match = topo.get("matches", {}).get(method, {})
+        # Always retain the independent 1plaq parameter combination for diagnostics.
+        variants = [("1plaq", alpha_1, fit1.get("alpha_err"))]
+        if cfg["renormalization"]["alpha_topo_fit"] and match.get("bracketed"):
+            variants.append(("obs_fit_topo", match["value"], match.get("error")))
+        for suffix, alpha, error in variants:
+            name = "_".join(x for x in (method, suffix) if x)
+            couplings = {**baseline, "alpha": alpha}
+            results[name] = {"couplings": couplings, "errors": {
+                "beta": fit2.get("beta_err"), "beta1": beta_match.get("error"),
+                "alpha": error, "alpha1": fit2.get("alpha1_err")},
+                "error_scope": "beta_and_alpha1_conditional_on_1plaq_alpha",
+                "alpha_source": fit1.get("source", "1plaq") if suffix == "1plaq" else "topo_single_correction",
+                "topo_correction": {key: match[key] for key in (
+                    "alpha_before", "alpha_after", "alpha_correction", "correction_success",
+                    "two_plaq_mse_before", "two_plaq_mse_after", "reason") if key in match}}
+            if all(value is not None for value in couplings.values()):
+                fragments[name] = "\n".join(f"{key} = {value!r}" for key,value in couplings.items())
     return {"results": results, "renorm_as_fine": fragments}
 
 
@@ -783,11 +821,10 @@ def _run_mod_pipeline(cfg: dict, output_root: str | Path) -> dict:
             if widths:
                 cfg["chains"].update(widths)
                 break
-    alpha_methods = cfg["renormalization"]["alpha_methods"]
-    need_one = ("1plaq" in alpha_methods and
-                ("z" in _renorm_types(cfg) or abs(float(cfg["model"]["alpha"])) >= 1e-12))
     if shared:
-        pilot, two_plaq, one_plaq, common_chains = shared[0]
+        pilot, two_plaq, one_plaq, common_chains, common_raw = shared[0]
+        if common_raw is not None:
+            cfg["_two_raw"] = common_raw
         cfg["chains"].update(common_chains)
     else:
         common_cfg = mod_config(cfg, 0) if float(cfg["model"]["beta1"]) == 0 else cfg
@@ -797,21 +834,25 @@ def _run_mod_pipeline(cfg: dict, output_root: str | Path) -> dict:
         if cfg["runtime"]["auto_chains"]:
             from .chain_tuning import _workloads, tune_stage
             workloads = _workloads(common_cfg, pilot)
-            two_path = common_dir / "step1_2plaq" / "result.json"
+            one_path = common_dir / "step1_1plaq" / "result.json"
+            identify_alpha = ("z" in _renorm_types(common_cfg) or float(common_cfg["model"]["alpha"]) != 0.0)
+            if identify_alpha and (cfg.get("_force") or not one_path.exists() or
+                    read_json(one_path).get("fingerprint") != _one_fit_key(common_cfg, geometry)):
+                tune_stage(common_cfg, "one_plaq", workloads["one_plaq"])
+        one_plaq = _run_one_plaq(common_cfg, common_dir, geometry)
+        if cfg["runtime"]["auto_chains"]:
+            two_path = common_dir / "step2_2plaq" / "result.json"
             if (cfg.get("_force") or not two_path.exists() or
-                    read_json(two_path).get("fingerprint") != patch_result_key(common_cfg, geometry, "two_plaq")):
+                    read_json(two_path).get("fingerprint") != _two_fit_key(common_cfg, geometry, one_plaq)):
                 tune_stage(common_cfg, "two_plaq", workloads["two_plaq"])
-            if need_one:
-                one_path = common_dir / "step3a_1plaq" / "result.json"
-                if (cfg.get("_force") or not one_path.exists() or
-                        read_json(one_path).get("fingerprint") != patch_result_key(common_cfg, geometry, "one_plaq")):
-                    tune_stage(common_cfg, "one_plaq", workloads["one_plaq"])
-        two_plaq = _run_two_plaq(common_cfg, common_dir, geometry)
-        one_plaq = _run_one_plaq(common_cfg, common_dir, geometry) if need_one else {"fits": {}}
+        two_plaq = _run_two_plaq(common_cfg, common_dir, geometry, one_plaq)
         common_chains = {key: common_cfg["chains"][key]
                          for key in ("pilot", "two_plaq", "one_plaq")}
         cfg["chains"].update(common_chains)
-        shared.append((pilot, two_plaq, one_plaq, common_chains))
+        common_raw = common_cfg.get("_two_raw")
+        if common_raw is not None:
+            cfg["_two_raw"] = common_raw
+        shared.append((pilot, two_plaq, one_plaq, common_chains, common_raw))
     geometry = pilot["geometry"]
     branches, chains = {}, {}
     for renorm_type in _renorm_types(cfg):
@@ -823,21 +864,56 @@ def _run_mod_pipeline(cfg: dict, output_root: str | Path) -> dict:
                 previous_chains.get(branch_name, {}).items()
                 if key.startswith(("observable_", "topo_"))})
         cfg["_tuned_measurements"] = set()
-        fit2 = two_plaq["fits"][renorm_type]
-        beta_c, alpha_eff_c = float(fit2["beta"]), float(fit2["alpha_eff"])
-        step2 = (_run_beta1_scan(cfg, branch_dir, geometry, beta_c, alpha_eff_c,
-                                renorm_type=renorm_type)
+        fit2 = two_plaq["fits"][renorm_type]["new"]
+        beta_c, alpha1_c = float(fit2["beta"]), float(fit2["alpha1"])
+        fit1 = one_plaq["fits"][renorm_type]
+        alpha_1 = float(fit1["alpha"])
+        step2 = (_run_beta1_scan(cfg, branch_dir, geometry, beta_c, alpha1_c,
+                                renorm_type=renorm_type, alpha_c=alpha_1)
                  if cfg["renormalization"]["beta1_methods"] else {"matches": {}})
-        fit1 = one_plaq.get("fits", {}).get(renorm_type, {})
-        alpha_1 = fit1.get("alpha")
-        unavailable = renorm_type == "U" and abs(float(cfg["model"]["alpha"])) < 1e-12
-        if "topo" not in alpha_methods or unavailable:
+        unavailable = renorm_type == "U" and float(cfg["model"]["alpha"]) == 0.0
+        if (not cfg["renormalization"]["alpha_topo_fit"] or
+                not cfg["renormalization"]["beta1_methods"] or unavailable):
             topo = {"matches": {}}
         else:
-            topo = _run_topo(cfg, branch_dir, geometry, beta_c, alpha_eff_c,
+            topo = _run_topo(cfg, branch_dir, geometry, beta_c, alpha1_c,
                              step2["matches"], alpha_1, renorm_type=renorm_type)
+        for match in topo.get("matches", {}).values():
+            if match.get("bracketed") and "two_plaq_mse_after" not in match:
+                raw = cfg.get("_two_raw")
+                raw_source = cfg.get("_two_raw_source", "current_fit")
+                if raw is None:
+                    measurement_path = common_dir / "step2_2plaq" / "measurements.npz"
+                    if measurement_path.exists():
+                        raw_source = "persisted_measurements"
+                        with np.load(measurement_path) as stored:
+                            raw = {key: stored[key] for key in stored.files}
+                    else:
+                        raw_source = "regenerated_measurements"
+                        raw = generate_two_plaq(mod_config(cfg, 0) if float(cfg["model"]["beta1"]) == 0 else cfg,
+                                                geometry, common_dir / "step2_2plaq" / "batches")
+                    cfg["_two_raw"] = raw
+                    cfg["_two_raw_source"] = raw_source
+                baseline_mse = fit2["mse"]
+                if raw_source == "regenerated_measurements":
+                    baseline_mse = isolated_fit("two_mse", {
+                        "N": int(cfg["model"]["N"]),
+                        "device": str(resolve_device(cfg["runtime"]["device"])),
+                        "parameters": [beta_c, alpha_1, alpha1_c]},
+                        X=raw[f"X_{renorm_type}"], freq=raw[f"freq_{renorm_type}"])["mse"]
+                diagnostic = isolated_fit("two_mse", {"N": int(cfg["model"]["N"]),
+                    "device": str(resolve_device(cfg["runtime"]["device"])),
+                    "nodes": fit2["normalization_nodes"],
+                    "parameters": [beta_c, match["value"], alpha1_c]},
+                    X=raw[f"X_{renorm_type}"], freq=raw[f"freq_{renorm_type}"])
+                match.update(two_plaq_mse_before=baseline_mse, two_plaq_mse_after=diagnostic["mse"],
+                             two_plaq_fit_mse=fit2["mse"], two_plaq_diagnostic_data_source=raw_source,
+                             two_plaq_final_diagnostic=diagnostic)
+        if topo.get("matches"):
+            atomic_json(branch_dir / "step4_topo" / "result.json",
+                        {key: value for key, value in topo.items() if not key.startswith("_")})
         branches[branch_name] = _branch_summary(
-            cfg, run_name, renorm_type, geometry, beta_c, alpha_eff_c, alpha_1,
+            cfg, run_name, renorm_type, geometry, beta_c, alpha1_c, alpha_1,
             step2, topo, fit2=fit2, fit1=fit1)
         cleanup = list(step2.get("_cleanup_folders", [])) + list(topo.get("_cleanup_folders", []))
         _remove_scan_ensembles(branch_dir, cleanup)
@@ -848,6 +924,12 @@ def _run_mod_pipeline(cfg: dict, output_root: str | Path) -> dict:
 def run_pipeline(cfg: dict, output_root: str | Path) -> dict:
     """Run only requested methods, sharing compatible type/mod measurements."""
     run_dir = workspace_dir(cfg, output_root)
+    for name in ("summary.json", "resolved.json"):
+        path = run_dir / name
+        if path.exists() and read_json(path).get("pipeline_revision") != 3:
+            archive = path.with_name(path.stem + ".legacy.json")
+            if not archive.exists():
+                atomic_copy(path, archive)
     shared, records, results, branches, chains = [], {}, {}, {}, {}
     try:
         for mod in cfg["model"]["mod"]:
@@ -862,11 +944,11 @@ def run_pipeline(cfg: dict, output_root: str | Path) -> dict:
             branches.update(result["branches"])
             chains.update(result["chains"])
         geometries = {name: item["geometry"] for name, item in results.items()}
-        summary = {"model": cfg["model"], "renormalization": cfg["renormalization"],
+        summary = {"pipeline_revision": 3, "model": cfg["model"], "renormalization": cfg["renormalization"],
                    "geometries": geometries, "branches": branches}
         resolved_path = run_dir / "resolved.json"
         resolved = read_json(resolved_path) if resolved_path.exists() else {}
-        resolved.update(config={k: v for k, v in cfg.items() if not k.startswith("_")},
+        resolved.update(pipeline_revision=3, config={k: v for k, v in cfg.items() if not k.startswith("_")},
                         geometries=geometries, chains=chains)
         # Pilot details have a single owner: pilot/result.json.
         resolved.pop("pilots", None)

@@ -35,9 +35,11 @@ class ConfigTests(unittest.TestCase):
 
     def test_example_config_and_geometry(self):
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
+        self.assertNotIn("alpha_methods", DEFAULTS["renormalization"])
+        self.assertNotIn("alpha_methods", cfg["renormalization"])
         geo = resolved_geometry(cfg, 2.01)
         self.assertEqual(geo["padding"], 5)
-        self.assertEqual(geo["L_coarse"], 20)
+        self.assertEqual(geo["L_coarse"], 10)
         self.assertEqual(geo["L_fine"] % cfg["renormalization"]["factor"], 0)
         self.assertEqual(geo["L_coarse"] * geo["factor"], geo["L_fine"])
 
@@ -96,7 +98,7 @@ class ConfigTests(unittest.TestCase):
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
         self.assertEqual(cfg["steps"]["two_plaq"]["fit_times"], 5000)
         self.assertEqual(cfg["steps"]["two_plaq"]["min_meas_per_boundary"], 3000)
-        self.assertEqual(cfg["steps"]["one_plaq"]["fit_times"], 2000)
+        self.assertEqual(cfg["steps"]["one_plaq"]["fit_times"], 3000)
         self.assertEqual(cfg["steps"]["one_plaq"]["min_meas_per_boundary"], 1000)
         self.assertEqual(cfg["scan"]["beta1"]["refine_tolerance"], 0.02)
         self.assertEqual(cfg["scan"]["alpha"]["refine_tolerance"], 0.002)
@@ -144,9 +146,9 @@ class ConfigTests(unittest.TestCase):
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
         self.assertNotIn("chains", cfg["runtime"])
         self.assertEqual(cfg["chains"], {
-            "pilot": 32, "two_plaq": 2048, "observable_fine": 128,
-            "observable_coarse": 128, "one_plaq": 2048,
-            "topo_fine": 256, "topo_coarse": 256,
+            "pilot": 32, "two_plaq": 1024, "observable_fine": 64,
+            "observable_coarse": 64, "one_plaq": 2048,
+            "topo_fine": 128, "topo_coarse": 128,
         })
         self.assertNotIn("chains", cfg["pilot"])
         for name, settings in cfg["steps"].items():
@@ -202,3 +204,14 @@ class ConfigTests(unittest.TestCase):
             path.write_text(source + "\n[steps.observable.old]\nn_meas = 10\n")
             with self.assertRaisesRegex(ValueError, "min_meas_total"):
                 load_config(path)
+
+    def test_alpha_topo_fit_is_a_boolean(self):
+        cfg = load_config(Path(__file__).parents[1] / 'configs/example.toml')
+        self.assertIs(DEFAULTS['renormalization']['alpha_topo_fit'], True)
+        for enabled in (False, True):
+            cfg['renormalization']['alpha_topo_fit'] = enabled
+            validate_config(cfg)
+        for invalid in (0, 1, 'true', 'false', None, []):
+            cfg['renormalization']['alpha_topo_fit'] = invalid
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'alpha_topo_fit must be a boolean'):
+                validate_config(cfg)

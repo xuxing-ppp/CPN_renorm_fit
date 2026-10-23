@@ -19,12 +19,46 @@ from .cache import (load_point, point_identity, read_json, store_point,
 from .config import fingerprint, mod_config, section
 from .patches import patch_result_key
 from .pilot import _pilot_fingerprint
-from .pipeline import (_branch_summary, _method_key, _scan_fingerprint, _scan_points,
+from .pipeline import (_method_key, _scan_fingerprint, _scan_points,
                        _raw_scan_match, _scan_decision, _censored_xi_G_bracket, _same_point)
 from .fit_client import extend_scan
 from .methods import BETA1_METHODS
 from .storage import atomic_copy, atomic_json
 from .workspace import config_fingerprint
+
+
+def _branch_summary(cfg: dict, run_name: str, renorm_type: str, geometry: dict,
+                    beta_c: float, alpha_eff_c: float, alpha_1: float | None,
+                    step2: dict, topo: dict, *, fit2: dict | None = None,
+                    fit1: dict | None = None) -> dict:
+    """Serialize historical results only; never used by the active pipeline."""
+    fit2, fit1 = fit2 or {}, fit1 or {}
+    beta_methods = cfg["renormalization"]["beta1_methods"]
+    alpha_methods = cfg["renormalization"].get("alpha_methods", ("1plaq", "topo"))
+    results, fragments = {}, {}
+    for beta_method in beta_methods or [None]:
+        beta_match = step2.get("matches", {}).get(beta_method, {})
+        for alpha_method in alpha_methods or [None]:
+            if alpha_method == "1plaq":
+                alpha, alpha_err = alpha_1, fit1.get("alpha_err")
+            elif alpha_method == "topo":
+                match = topo.get("matches", {}).get(beta_method, {})
+                alpha, alpha_err = match.get("value"), match.get("error")
+            else:
+                alpha = alpha_err = None
+            name = (f"{beta_method}_obs_fit_topo" if alpha_method == "topo" else
+                    "_".join(x for x in (beta_method, alpha_method) if x) or "unfitted")
+            couplings = {"beta": beta_c, "beta1": beta_match.get("value"),
+                         "alpha": alpha,
+                         "alpha1": alpha_eff_c - alpha if alpha is not None else None,
+                         "alpha_eff": alpha_eff_c}
+            errors = {"beta": fit2.get("beta_err"), "beta1": beta_match.get("error"),
+                      "alpha": alpha_err, "alpha_eff": fit2.get("alpha_eff_err")}
+            results[name] = {"couplings": couplings, "errors": errors}
+            if all(couplings[key] is not None for key in ("beta", "beta1", "alpha", "alpha1")):
+                fragments[name] = "\n".join(f"{key} = {couplings[key]!r}"
+                                            for key in ("beta", "beta1", "alpha", "alpha1"))
+    return {"results": results, "renorm_as_fine": fragments}
 
 
 def _require(condition: bool, detail: object) -> None:
@@ -52,11 +86,14 @@ def _rename_legacy_length(value):
     return label(value) if isinstance(value, str) else value
 
 
-def update_toml(path: Path, beta1: list[str], alpha: list[str]) -> None:
+def update_toml(path: Path, beta1: list[str]) -> None:
     text = _rename_legacy_length(path.read_text(encoding="utf-8"))
+    text = re.sub(r"(?m)^\s*alpha_methods\s*=.*\n?", "", text)
     if "beta1_methods" not in text:
         text = text.replace("[renormalization]\n", "[renormalization]\n"
-                            f"beta1_methods = {beta1!r}\nalpha_methods = {alpha!r}\n".replace("'", '"'))
+                            f"beta1_methods = {beta1!r}\n".replace("'", '"'))
+    if "alpha_topo_fit" not in text:
+        text = text.replace("[renormalization]\n", "[renormalization]\nalpha_topo_fit = true\n")
     if "[storage]" not in text:
         text += "\n[storage]\nsave_npz = false\n"
     path.write_text(text, encoding="utf-8")
@@ -317,8 +354,9 @@ def _migrate_copy(root: Path) -> dict:
     beta1 = [name for name in ("magsus", "corrG")
              if any(name in branch["renormalized_couplings"].get("beta1_c", {})
                     for branch in old["branches"].values())]
-    alpha = ["1plaq", "topo"]
-    cfg["renormalization"].update(beta1_methods=beta1, alpha_methods=alpha)
+    cfg["renormalization"].pop("alpha_methods", None)
+    cfg["renormalization"].setdefault("alpha_topo_fit", True)
+    cfg["renormalization"].update(beta1_methods=beta1)
     cfg["storage"] = {"save_npz": False}
     cfg["_config_path"] = state.get("source", str(root / "input.toml"))
     chains = resolved.get("chains", old.get("chains", {}))
@@ -476,7 +514,7 @@ def _migrate_copy(root: Path) -> dict:
     state["config_fingerprint"] = config_fingerprint(cfg)
     atomic_json(root / "run_state.json", state)
     for path in root.rglob("*.toml"):
-        update_toml(path, beta1, alpha)
+        update_toml(path, beta1)
     report = {"run": root.name, "recovered_scalar_points": recovered,
               "historical_point_phases": "unknown; retained as historical",
               "removed_npz": len(list(root.rglob("*.npz"))),

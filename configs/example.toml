@@ -9,7 +9,8 @@ mod = [1]
 
 [renormalization]
 beta1_methods = ["magsus", "corrG"]
-alpha_methods = ["1plaq", "topo"]
+# Optional single topo correction; 1plaq always runs.
+alpha_topo_fit = true
 type = ["z"]
 # Linear blocking factor; this is the patch L used by legacy 1plaq/2plaq fits.
 factor = 4
@@ -25,12 +26,12 @@ seed = 1018
 [chains]
 # Manual batch widths, also used as search seeds when auto_chains=true.
 pilot = 32
-two_plaq = 2048
-observable_fine = 128
-observable_coarse = 128
+two_plaq = 1024
+observable_fine = 64
+observable_coarse = 64
 one_plaq = 2048
-topo_fine = 256
-topo_coarse = 256
+topo_fine = 128
+topo_coarse = 128
 
 [pilot]
 # Pilot chains are independent PBC replicas used only to estimate xi_G.
@@ -58,7 +59,7 @@ coarse_L = -1
 # Optional bounds for automatically derived values. -1 means unbounded.
 padding_min = -1
 padding_max = -1
-coarse_L_min = 20
+coarse_L_min = 10
 coarse_L_max = -1
 # These multipliers are consulted only when the corresponding override is -1.
 padding_xi_G_mul = 2.0
@@ -89,8 +90,8 @@ strict = false
 
 [scan.beta1]
 # Explicit points are simulated first; min/max bound any automatic bracket expansion.
-min = -16.0
-max = 4.0
+min = -32.0
+max = 32.0
 points = []
 growth_factor = 2.0
 max_rounds = 7
@@ -135,10 +136,10 @@ min_warmup = 400
 max_warmup = 4000
 # Every boundary receives at least this many samples. A batch stops together
 # after every chain reaches target ESS, or at max_meas_per_boundary.
-min_meas_per_boundary = 3000
-target_ess_per_boundary = 600
-max_meas_per_boundary = 12000
-bins = 60
+min_meas_per_boundary = 4096
+target_ess_per_boundary = 1024
+max_meas_per_boundary = 32768
+bins = 128
 p0 = { U = [2.0, 0.0], z = [2.0, 0.0] }
 
 [steps.observable]
@@ -148,16 +149,16 @@ min_warmup = 400
 max_warmup = 8000
 min_meas_total = 100000
 target_ess = 5000
-max_meas_total = 400000
+max_meas_total = 500000
 
 [steps.one_plaq]
 # Same batching and per-boundary semantics as two_plaq.
-fit_times = 2000
+fit_times = 3000
 min_warmup = 400
 max_warmup = 4000
-min_meas_per_boundary = 1000
-target_ess_per_boundary = 200
-max_meas_per_boundary = 4000
+min_meas_per_boundary = 2048
+target_ess_per_boundary = 512
+max_meas_per_boundary = 16384
 zero_pad = 1
 p0 = { U = 1.0, z = 1.0 }
 
@@ -166,7 +167,7 @@ min_warmup = 400
 max_warmup = 8000
 min_meas_total = 100000
 target_ess = 5000
-max_meas_total = 400000
+max_meas_total = 500000
 
 [storage]
 # Persist raw measurement arrays; scalar JSON caches are always saved.

@@ -23,6 +23,11 @@ import numpy as np
 ROOT = Path(__file__).parents[1]
 
 
+def raw_placeholder():
+    return {f"{key}_{tag}": np.ones((1,9)) if key == "X" else np.ones(1)
+            for key in ("X", "freq") for tag in ("U", "z")}
+
+
 class PipelineWorkspaceTests(unittest.TestCase):
     @staticmethod
     def _patch_raw() -> dict:
@@ -51,35 +56,36 @@ class PipelineWorkspaceTests(unittest.TestCase):
         cfg = load_config(ROOT / "configs" / "example.toml")
         cfg["runtime"]["device"] = "cpu"
         cfg["model"]["alpha"] = 0.2
+        cfg["renormalization"]["type"] = ["z", "U"]
         geometry = {"padding": 0, "L_fine": 8, "L_coarse": 2, "factor": 4}
         raw = self._patch_raw()
 
         def fake_fit(operation, _request, *, X, **_arrays):
             marker = float(X[0, 0])
-            return ({"beta": marker, "alpha_eff": marker / 10}
-                    if operation == "two_plaq" else {"alpha": marker})
+            return ({"new": {"beta": marker, "alpha1": marker / 10}}
+                    if operation == "two_fixed" else {"alpha": marker})
 
         with tempfile.TemporaryDirectory(dir=ROOT) as folder, patch(
                 "cpn_renorm.pipeline.generate_two_plaq", return_value=raw), patch(
                 "cpn_renorm.pipeline.generate_one_plaq", return_value=raw), patch(
                 "cpn_renorm.pipeline.isolated_fit", side_effect=fake_fit) as fit:
-            two = _run_two_plaq(cfg, Path(folder), geometry)
             one = _run_one_plaq(cfg, Path(folder), geometry)
+            two = _run_two_plaq(cfg, Path(folder), geometry, one)
         self.assertEqual(set(two["fits"]), {"U", "z"})
-        self.assertEqual(two["fits"]["U"]["beta"], 1.0)
-        self.assertEqual(two["fits"]["z"]["beta"], 2.0)
+        self.assertEqual(two["fits"]["U"]["new"]["beta"], 1.0)
+        self.assertEqual(two["fits"]["z"]["new"]["beta"], 2.0)
         self.assertEqual(one["fits"]["U"]["alpha"], 3.0)
         self.assertEqual(one["fits"]["z"]["alpha"], 2.0)
         self.assertEqual(fit.call_count, 4)
 
     def test_pipeline_uses_stable_workspace_and_compact_summary(self):
         cfg = load_config(ROOT / "configs" / "example.toml")
-        cfg["renormalization"]["alpha_methods"] = ["1plaq"]
+        cfg["renormalization"]["alpha_topo_fit"] = False
         cfg["runtime"]["device"] = "cpu"
         geometry = {"padding": 5, "L_fine": 28, "L_coarse": 7, "factor": 4}
         pilot = {"xi_G": 2.0, "xi_G_err": 0.1, "geometry": geometry}
-        step1 = {"fits": {"z": {"beta": 0.6, "alpha_eff": 0.2},
-                          "U": {"beta": 0.7, "alpha_eff": 0.25}}}
+        step1 = {"fits": {"z": {"new": {"beta": 0.6, "alpha1": 0.2, "mse": .01, "normalization_nodes": 512}},
+                          "U": {"new": {"beta": 0.7, "alpha1": 0.25}}}}
         match = {"value": 0.3, "bracketed": True}
         step2 = {"matches": {"magsus": match, "corrG": match}}
         step3 = {"fits": {"z": {"alpha": 0.1}, "U": {"alpha": None}}}
@@ -88,8 +94,10 @@ class PipelineWorkspaceTests(unittest.TestCase):
                 "cpn_renorm.pipeline.run_pilot", return_value=pilot) as run_pilot, patch(
                 "cpn_renorm.pipeline._run_two_plaq", return_value=step1), patch(
                 "cpn_renorm.pipeline._run_beta1_scan", return_value=step2), patch(
-                "cpn_renorm.pipeline._run_one_plaq", return_value=step3):
+                "cpn_renorm.pipeline._run_one_plaq", return_value=step3), patch(
+                "cpn_renorm.pipeline._run_topo", return_value={"matches": {}}) as topo:
             summary = run_pipeline(cfg, Path(folder))
+            topo.assert_not_called()
             expected = Path(folder).resolve() / "example"
             self.assertEqual(run_pilot.call_args.args[1], expected)
             self.assertEqual(summary["model"], cfg["model"])
@@ -98,9 +106,9 @@ class PipelineWorkspaceTests(unittest.TestCase):
             self.assertEqual(branch["results"]["magsus_1plaq"]["couplings"]["beta"], 0.6)
             self.assertEqual(branch["results"]["magsus_1plaq"]["couplings"]["alpha"], 0.1)
             exported = tomllib.loads(branch["renorm_as_fine"]["magsus_1plaq"])
-            self.assertEqual(exported, {"beta": .6, "beta1": .3, "alpha": .1, "alpha1": .1})
+            self.assertEqual(exported, {"beta": .6, "beta1": .3, "alpha": .1, "alpha1": .2})
             self.assertEqual(set(branch["results"]["magsus_1plaq"]["couplings"]),
-                             {"beta", "beta1", "alpha", "alpha1", "alpha_eff"})
+                             {"beta", "beta1", "alpha", "alpha1"})
             self.assertNotIn("fit_points", branch)
             self.assertTrue((expected / "input.toml").exists())
             self.assertTrue((expected / "summary.json").exists())
@@ -113,8 +121,8 @@ class PipelineWorkspaceTests(unittest.TestCase):
         cfg["model"]["alpha"] = 0.2
         geometry = {"padding": 0, "L_fine": 8, "L_coarse": 2, "factor": 4}
         pilot = {"xi_G": 1.0, "xi_G_err": 0.1, "geometry": geometry}
-        two = {"fits": {"z": {"beta": 0.6, "alpha_eff": 0.2},
-                        "U": {"beta": 0.7, "alpha_eff": 0.3}}}
+        two = {"fits": {"z": {"new": {"beta": 0.6, "alpha1": 0.2, "mse": .01, "normalization_nodes": 512}},
+                        "U": {"new": {"beta": 0.7, "alpha1": 0.3, "mse": .01, "normalization_nodes": 512}}}}
         one = {"fits": {"z": {"alpha": 0.1}, "U": {"alpha": 0.15}}}
         match = {"value": 0.3, "error": 0.01, "bracketed": True}
         scan = {"matches": {"magsus": match, "corrG": match}}
@@ -124,7 +132,9 @@ class PipelineWorkspaceTests(unittest.TestCase):
                 "cpn_renorm.pipeline._run_two_plaq", return_value=two) as run_two, patch(
                 "cpn_renorm.pipeline._run_one_plaq", return_value=one) as run_one, patch(
                 "cpn_renorm.pipeline._run_beta1_scan", return_value=scan) as run_beta, patch(
-                "cpn_renorm.pipeline._run_topo", return_value=topo) as run_topo:
+                "cpn_renorm.pipeline._run_topo", return_value=topo) as run_topo, patch(
+                "cpn_renorm.pipeline.generate_two_plaq", return_value=raw_placeholder()), patch(
+                "cpn_renorm.pipeline.isolated_fit", return_value={"mse": .01}):
             summary = run_pipeline(cfg, Path(folder))
         run_two.assert_called_once()
         run_one.assert_called_once()
@@ -247,7 +257,7 @@ class PipelineWorkspaceTests(unittest.TestCase):
                 side_effect=fake_measure) as measure_mock, patch(
                 "cpn_renorm.pipeline.isolated_plot") as plot_mock:
             run_dir = Path(folder)
-            old_plot = run_dir / "step2_observable" / "beta1_scan.png"
+            old_plot = run_dir / "step3_observable" / "beta1_scan.png"
             old_plot.parent.mkdir(parents=True)
             old_plot.write_bytes(b"old combined plot")
             result = _run_beta1_scan(cfg, run_dir, geometry, 1.0, 0.1)

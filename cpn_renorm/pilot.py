@@ -30,7 +30,7 @@ def fine_sampler(cfg: dict, L: int, settings: dict, *, seed_offset: int = 0,
     m, rt = cfg["model"], cfg["runtime"]
     # At alpha=0 the integer field is unconstrained. The alpha1 cosine term is
     # exactly represented by halfRefVil, so pilot xi_G must not create a random s walk.
-    kind = "full" if abs(float(m["alpha"])) > 1e-12 else "half"
+    kind = "full" if float(m["alpha"]) > 0.0 else "half"
     alpha = float(m["alpha"]) if kind == "full" else float(m["alpha"] + m["alpha1"])
     alpha1 = float(m["alpha1"]) if kind == "full" else 0.0
     return BatchedHMCSampler(

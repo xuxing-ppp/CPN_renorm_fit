@@ -71,7 +71,7 @@ def recommend_chains(rows: list[dict], throughput_fraction: float = 0.9) -> int 
 def _fine_action(cfg: dict) -> tuple[Couplings, ActionKind]:
     model = cfg["model"]
     alpha = float(model["alpha"])
-    if abs(alpha) > 1e-12:
+    if alpha > 0:
         return (Couplings(float(model["beta"]), float(model["beta1"]), alpha,
                           float(model["alpha1"]), int(model["mod"])), "full")
     return (Couplings(float(model["beta"]), float(model["beta1"]),
@@ -90,10 +90,6 @@ def _workloads(cfg: dict, pilot: dict) -> dict[str, list[Workload]]:
     factor, pad = int(geometry["factor"]), int(geometry["padding"])
     fine_L, coarse_L = int(geometry["L_fine"]), int(geometry["L_coarse"])
     base, base_kind = _fine_action(cfg)
-    folded = Couplings(float(model["beta"]), float(model["beta1"]),
-                       float(model["alpha"] + model["alpha1"]), 0.0,
-                       int(model["mod"]))
-
     valid_attempts = [x for x in pilot["attempts"] if x.get("valid")]
     pilot_L = int(valid_attempts[-1]["L"])
     pilot_settings = section(cfg, "pilot")
@@ -106,16 +102,14 @@ def _workloads(cfg: dict, pilot: dict) -> dict[str, list[Workload]]:
                            settings_name="pilot")]
     }
 
-    for stage, width, height in (("two_plaq", 2 * factor, factor),
-                                 ("one_plaq", factor, factor)):
-        if stage == "one_plaq" and "1plaq" not in cfg["renormalization"]["alpha_methods"]:
-            continue
+    for stage, width, height in (("one_plaq", factor, factor),
+                                 ("two_plaq", 2 * factor, factor)):
         settings = section(cfg, stage)
         fit_times = int(settings["fit_times"])
         periodic = cfg["geometry"]["boundary_bc"] == "PBC"
         add = 0 if periodic else 1
-        inner_kind = "half" if stage == "two_plaq" else base_kind
-        inner_couplings = folded if stage == "two_plaq" else base
+        inner_kind = base_kind
+        inner_couplings = base
         stages[stage] = [
             Workload("outer_boundary", width + 2 * pad + add,
                      height + 2 * pad + add, periodic, inner_kind,
@@ -136,14 +130,14 @@ def _workloads(cfg: dict, pilot: dict) -> dict[str, list[Workload]]:
     beta_samples = beta_scan.get("points") or [
         x for x in (-0.1, 0.0, 0.1) if beta_scan["min"] <= x <= beta_scan["max"]]
     coarse_beta1 = max(beta_samples or [beta_scan["min"], beta_scan["max"]], key=abs)
-    coarse_folded = replace(folded, beta1=float(coarse_beta1))
+    coarse_reference = replace(base, beta1=float(coarse_beta1))
     beta_points = len(cfg["scan"]["beta1"].get("points", [])) or 3
     obs_sweeps = _sampling_sweeps(observable)
     stages["observable"] = [
-        Workload("fine", fine_L, fine_L, True, "half", folded, obs_sweeps,
+        Workload("fine", fine_L, fine_L, True, base_kind, base, obs_sweeps,
                  int(math.ceil(observable["max_meas_total"] / observable["chains"])), True,
                  int(observable["max_meas_total"]), settings_name="observable"),
-        Workload("coarse_scan", coarse_L, coarse_L, True, "half", coarse_folded,
+        Workload("coarse_scan", coarse_L, coarse_L, True, base_kind, coarse_reference,
                  obs_sweeps * beta_points,
                  int(math.ceil(observable["max_meas_total"] / observable["chains"]))
                  * beta_points, True,
@@ -154,8 +148,9 @@ def _workloads(cfg: dict, pilot: dict) -> dict[str, list[Workload]]:
     types = set(cfg["renormalization"]["type"])
     if not cfg["renormalization"]["beta1_methods"]:
         stages.pop("observable", None)
-    topo_enabled = ("topo" in cfg["renormalization"]["alpha_methods"] and
-                    not (types == {"U"} and abs(float(model["alpha"])) < 1e-12))
+    topo_enabled = (cfg["renormalization"]["alpha_topo_fit"] and
+                    bool(cfg["renormalization"]["beta1_methods"]) and
+                    not (types == {"U"} and float(model["alpha"]) == 0.0))
     if topo_enabled:
         topo = section(cfg, "topo")
         topo_sweeps = _sampling_sweeps(topo)
@@ -622,7 +617,7 @@ def run_chain_tuning(cfg: dict, output_dir: str | Path, **limits) -> dict:
             if stage == "pilot":
                 continue
             if stage == "one_plaq" and (branch["renormalization"]["type"] == ["U"]
-                                        and abs(float(branch["model"]["alpha"])) < 1e-12):
+                                        and float(branch["model"]["alpha"]) == 0.0):
                 continue
             if not independent and stage in shared_chains:
                 continue

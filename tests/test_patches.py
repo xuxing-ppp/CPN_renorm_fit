@@ -313,7 +313,7 @@ class PatchTests(unittest.TestCase):
         geometry = {"padding": 5, "L_fine": 28, "L_coarse": 7, "factor": 4}
         two_before = _batch_key(cfg, geometry, "two_plaq", 0)
         one_before = _batch_key(cfg, geometry, "one_plaq", 0)
-        with patch("cpn_renorm.patches.TWO_PLAQ_ALGORITHM_REVISION", 3):
+        with patch("cpn_renorm.patches.TWO_PLAQ_ALGORITHM_REVISION", 4):
             two_after = _batch_key(cfg, geometry, "two_plaq", 0)
             one_after = _batch_key(cfg, geometry, "one_plaq", 0)
         self.assertNotEqual(two_before, two_after)

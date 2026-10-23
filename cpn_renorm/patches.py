@@ -15,7 +15,7 @@ from .progress import SimulationProgress
 from .storage import atomic_npz
 
 
-TWO_PLAQ_ALGORITHM_REVISION = 2
+TWO_PLAQ_ALGORITHM_REVISION = 3
 
 
 @dataclass(frozen=True)
@@ -227,12 +227,9 @@ def _adapt_inner(sampler: BatchedHMCSampler, patch: RectanglePatch,
             "initialization": "copied_equilibrium", "adapt_steps": adapt_steps}
 
 
-def _fine_couplings(cfg: dict, *, fold_alpha: bool) -> tuple[Couplings, str]:
+def _fine_couplings(cfg: dict) -> tuple[Couplings, str]:
     m = cfg["model"]
-    if fold_alpha:
-        return Couplings(float(m["beta"]), float(m["beta1"]),
-                         float(m["alpha"] + m["alpha1"]), 0.0, int(m["mod"])), "half"
-    if abs(float(m["alpha"])) < 1e-12:
+    if float(m["alpha"]) == 0.0:
         return Couplings(float(m["beta"]), float(m["beta1"]), float(m["alpha1"]),
                          0.0, int(m["mod"])), "half"
     return Couplings(float(m["beta"]), float(m["beta1"]), float(m["alpha"]),
@@ -287,13 +284,13 @@ def _generate_two_plaq_batch_impl(cfg: dict, geometry: dict, batch_index: int,
                                    progress: SimulationProgress) -> dict:
     settings = section(cfg, "two_plaq")
     L, pad = int(cfg["renormalization"]["factor"]), int(geometry["padding"])
-    c, kind = _fine_couplings(cfg, fold_alpha=True)
+    c, kind = _fine_couplings(cfg)
     patch, outer_warmup = _outer_boundary(
         cfg, settings, L=L, pad=pad, width=2 * L, height=L,
         couplings=c, kind=kind, seed_offset=20_000 + 2 * batch_index,
         progress=progress)
     sampler = _make_sampler(cfg, settings, chains=int(settings["chains"]),
-                            Lx=2 * L + 1, Ly=L + 1, couplings=c, kind="half",
+                            Lx=2 * L + 1, Ly=L + 1, couplings=c, kind=kind,
                             periodic=False, seed_offset=20_001 + 2 * batch_index)
     zloop, aloop = patch.zloop, patch.aloop
     warmup = _adapt_inner(sampler, patch, settings, progress=progress)
@@ -361,7 +358,7 @@ def _generate_one_plaq_batch_impl(cfg: dict, geometry: dict, batch_index: int,
                                    progress: SimulationProgress) -> dict:
     settings = section(cfg, "one_plaq")
     L, pad = int(cfg["renormalization"]["factor"]), int(geometry["padding"])
-    c, kind = _fine_couplings(cfg, fold_alpha=False)
+    c, kind = _fine_couplings(cfg)
     patch, outer_warmup = _outer_boundary(
         cfg, settings, L=L, pad=pad, width=L, height=L,
         couplings=c, kind=kind, seed_offset=30_000 + 2 * batch_index,

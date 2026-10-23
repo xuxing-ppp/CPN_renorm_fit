@@ -8,13 +8,13 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from .methods import ALPHA_METHODS, BETA1_METHODS
+from .methods import BETA1_METHODS
 
 
 DEFAULTS: dict[str, Any] = {
     "storage": {"save_npz": False},
     "renormalization": {"beta1_methods": ["magsus", "corrG"],
-                        "alpha_methods": ["1plaq", "topo"]},
+                        "alpha_topo_fit": True},
     "runtime": {"device": "auto", "dtype": "float64", "seed": 1729,
                 "auto_chains": False},
     "chains": {"pilot": 16, "two_plaq": 32, "observable_fine": 16,
@@ -87,6 +87,10 @@ OBSOLETE_FIELDS = {
 def _reject_obsolete(raw: dict[str, Any], prefix: str = "") -> None:
     for key, value in raw.items():
         path = f"{prefix}.{key}" if prefix else key
+        if path == "renormalization.alpha_methods":
+            raise ValueError(
+                "obsolete configuration field renormalization.alpha_methods: remove it; "
+                "1plaq is required; use the boolean renormalization.alpha_topo_fit for topo")
         if path == "pilot.growth_factor":
             raise ValueError(
                 "obsolete configuration field pilot.growth_factor: "
@@ -168,15 +172,14 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if type(cfg["storage"]["save_npz"]) is not bool:
         raise ValueError("storage.save_npz must be a boolean")
     ren = cfg["renormalization"]
-    for key, allowed in (("beta1_methods", tuple(BETA1_METHODS)),
-                         ("alpha_methods", ALPHA_METHODS)):
+    if type(ren["alpha_topo_fit"]) is not bool:
+        raise ValueError("renormalization.alpha_topo_fit must be a boolean")
+    for key, allowed in (("beta1_methods", tuple(BETA1_METHODS)),):
         methods = ren[key]
         if (not isinstance(methods, list) or
                 any(not isinstance(x, str) or x not in allowed for x in methods) or
                 len(set(methods)) != len(methods)):
             raise ValueError(f"renormalization.{key} must be a unique list of {allowed}")
-    if "topo" in ren["alpha_methods"] and not ren["beta1_methods"]:
-        raise ValueError("topo requires at least one beta1 method")
     renorm_types = ren.get("type")
     if (not isinstance(renorm_types, list) or not renorm_types or
             any(value not in ("U", "z") for value in renorm_types) or

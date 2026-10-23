@@ -1,3 +1,4 @@
+import numpy as np
 import json
 import tempfile
 import tomllib
@@ -22,6 +23,19 @@ class AutoChainsTests(unittest.TestCase):
         cfg = load_config(ROOT / "configs/example.toml")
         cfg["runtime"].update(device="cpu", auto_chains=False)
         return cfg
+
+    def test_topology_tuning_obeys_alpha_topo_fit(self):
+        from cpn_renorm.chain_tuning import _workloads
+        cfg = self.config()
+        pilot = {'geometry': {'padding': 0, 'factor': 4, 'L_fine': 8, 'L_coarse': 2},
+                 'attempts': [{'L': 8, 'valid': True}]}
+        for enabled in (False, True):
+            cfg['renormalization']['alpha_topo_fit'] = enabled
+            workloads = _workloads(cfg, pilot)
+            self.assertIn('one_plaq', workloads)
+            self.assertIn('two_plaq', workloads)
+            self.assertEqual('topo_fine' in workloads, enabled)
+            self.assertEqual('topo_coarse' in workloads, enabled)
 
     def test_new_format_and_rejected_old_fields(self):
         for filename in ("example.toml",):
@@ -149,14 +163,13 @@ class AutoChainsTests(unittest.TestCase):
         self.assertEqual(result["chains"], 8)
         self.assertEqual([attempt["chains"] for attempt in result["attempts"]], [4, 8])
 
-    def test_auto_pipeline_persists_selected_chains_without_topology(self):
+    def test_auto_pipeline_persists_selected_chains_with_topology(self):
         cfg = self.config()
-        cfg["renormalization"]["alpha_methods"] = ["1plaq"]
         cfg["runtime"]["auto_chains"] = True
         geometry = {"padding": 0, "factor": 4, "L_fine": 8, "L_coarse": 2}
         pilot = {"xi_G": 1.0, "xi_G_err": 0.1, "geometry": geometry,
                  "attempts": [{"L": 8, "valid": True}]}
-        two = {"fits": {"z": {"beta": 0.6, "alpha_eff": 0.2}}}
+        two = {"fits": {"z": {"new": {"beta": 0.6, "alpha1": 0.2}}}}
         one = {"fits": {"z": {"alpha": 0.1}}}
         match = {"value": 0.3, "error": 0.01, "bracketed": True}
         scan = {"matches": {"magsus": match, "corrG": match}}
@@ -177,11 +190,11 @@ class AutoChainsTests(unittest.TestCase):
                 "cpn_renorm.pipeline._run_one_plaq", return_value=one), patch(
                 "cpn_renorm.pipeline._run_beta1_scan", side_effect=beta_scan), patch(
                 "cpn_renorm.chain_tuning._benchmark_stage", side_effect=benchmark), patch(
-                "cpn_renorm.pipeline._run_topo") as topo:
+                "cpn_renorm.pipeline._run_topo", return_value={"matches": {}}) as topo:
             summary = run_pipeline(cfg, folder)
             report = json.loads((Path(folder) / "example/chain_tuning.json").read_text())
             resolved = json.loads((Path(folder) / "example/resolved.json").read_text())
-        topo.assert_not_called()
+        topo.assert_called_once()
         self.assertEqual(resolved["chains"]["z_mod1"]["two_plaq"], 11)
         self.assertEqual(resolved["chains"]["z_mod1"]["observable_fine"], 13)
         self.assertNotIn("chains", summary)
@@ -196,9 +209,9 @@ class AutoChainsTests(unittest.TestCase):
                 cfg["renormalization"]["type"] = ["z", "U"]
                 geometry = {"padding": 0, "factor": 4, "L_fine": 8, "L_coarse": 2}
                 pilot = {"xi_G": 1.0, "xi_G_err": 0.1, "geometry": geometry}
-                fit2 = {"beta": 0.6123456789012345, "alpha_eff": 0.2123456789012345,
-                        "beta_err": 0.02, "alpha_eff_err": 0.03}
-                two = {"fits": {name: fit2 for name in ("z", "U")}}
+                fit2 = {"beta": 0.6123456789012345, "alpha1": 0.2123456789012345,
+                        "mse": .01, "normalization_nodes": 512, "beta_err": 0.02, "alpha1_err": 0.03}
+                two = {"fits": {name: {"new": fit2} for name in ("z", "U")}}
                 one = {"fits": {name: {"alpha": 0.1, "alpha_err": 0.04}
                                 for name in ("z", "U")}}
                 match = {"value": 0.3, "error": 0.01, "bracketed": True}
@@ -208,7 +221,11 @@ class AutoChainsTests(unittest.TestCase):
                         "cpn_renorm.pipeline._run_two_plaq", return_value=two) as t, patch(
                         "cpn_renorm.pipeline._run_one_plaq", return_value=one) as o, patch(
                         "cpn_renorm.pipeline._run_beta1_scan", return_value=scan) as b, patch(
-                        "cpn_renorm.pipeline._run_topo", return_value=scan) as a:
+                        "cpn_renorm.pipeline._run_topo", return_value=scan) as a, patch(
+                        "cpn_renorm.pipeline.generate_two_plaq", return_value={
+                            f"{key}_{tag}": np.ones((1,9)) if key == "X" else np.ones(1)
+                            for key in ("X", "freq") for tag in ("U", "z")}), patch(
+                        "cpn_renorm.pipeline.isolated_fit", return_value={"mse": .01}):
                     summary = run_pipeline(cfg, folder)
                     self.assertEqual(p.call_count, expected_common_calls)
                     self.assertEqual(t.call_count, expected_common_calls)
@@ -218,12 +235,12 @@ class AutoChainsTests(unittest.TestCase):
                     self.assertEqual(set(summary["branches"]),
                                      {"z_mod0", "z_mod1", "U_mod0", "U_mod1"})
                     for call in b.call_args_list:
-                        self.assertEqual(call.args[3:5], (fit2["beta"], fit2["alpha_eff"]))
+                        self.assertEqual(call.args[3:5], (fit2["beta"], fit2["alpha1"]))
                     for name, result in summary["branches"].items():
                         path = Path(folder) / "example/branches" / name / "summary.json"
                         self.assertFalse(path.exists())
                         self.assertEqual(result["results"]["magsus_1plaq"]["errors"]["beta"], 0.02)
-                        self.assertEqual(result["results"]["magsus_1plaq"]["errors"]["alpha_eff"], 0.03)
+                        self.assertEqual(result["results"]["magsus_1plaq"]["errors"]["alpha1"], 0.03)
                         self.assertEqual(result["results"]["magsus_1plaq"]["errors"]["alpha"], 0.04)
                         self.assertEqual(result["results"]["magsus_1plaq"]["couplings"]["beta"], fit2["beta"])
                     resolved = json.loads((Path(folder) / "example/resolved.json").read_text())

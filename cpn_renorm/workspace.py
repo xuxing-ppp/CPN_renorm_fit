@@ -9,7 +9,7 @@ from .config import fingerprint
 from .storage import atomic_copy, atomic_json
 
 
-STAGES = ("pilot", "two_plaq", "observable", "one_plaq", "topology")
+STAGES = ("pilot", "one_plaq", "two_plaq", "observable", "topology")
 ACTION_RANK = {"reuse": 0, "reprocess": 1, "resimulate": 2}
 
 
@@ -49,6 +49,9 @@ def _changes(old: dict[str, Any], new: dict[str, Any]) -> list[dict[str, Any]]:
         key = f"scan.{kind}.fit_spacing_growth_factor"
         before.setdefault(key, 2.0)
         after.setdefault(key, 2.0)
+    if any(key.startswith("renormalization.") for key in set(before) | set(after)):
+        before.setdefault("renormalization.alpha_topo_fit", True)
+        after.setdefault("renormalization.alpha_topo_fit", True)
     missing = "<missing>"
     return [
         {"path": path, "old": before.get(path, missing),
@@ -73,8 +76,9 @@ def affected_stages(changes: list[dict[str, Any]], *, beta1: float | None = None
             continue
         if path == "renormalization.beta1_methods":
             _raise_action(actions, ("observable", "topology"), "reprocess")
-        elif path == "renormalization.alpha_methods":
-            _raise_action(actions, ("one_plaq", "topology"), "reprocess")
+        elif path in ("renormalization.alpha_topo_fit", "renormalization.alpha_methods"):
+            # Only topology selection changed; upstream fits stay compatible.
+            _raise_action(actions, ("topology",), "reprocess")
         elif path == "renormalization.type":
             _raise_action(actions, ("observable", "topology"), "resimulate")
         elif path == "model.mod":
@@ -95,9 +99,9 @@ def affected_stages(changes: list[dict[str, Any]], *, beta1: float | None = None
         elif path.startswith(("steps.observable.", "chains.observable")):
             _raise_action(actions, ("observable", "topology"), "resimulate")
         elif path.startswith("steps.one_plaq.p0"):
-            _raise_action(actions, ("one_plaq", "topology"), "reprocess")
+            _raise_action(actions, ("one_plaq", "two_plaq", "observable", "topology"), "reprocess")
         elif path.startswith(("steps.one_plaq.", "chains.one_plaq")):
-            _raise_action(actions, ("one_plaq", "topology"), "resimulate")
+            _raise_action(actions, ("one_plaq", "two_plaq", "observable", "topology"), "resimulate")
         elif path.startswith("scan.alpha."):
             _raise_action(actions, ("topology",), "reprocess")
         elif path.startswith(("steps.topo.", "chains.topo")):

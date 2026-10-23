@@ -17,3 +17,6 @@ __pycache__/
 !/configs/example.toml
 /runs/*
 !/runs/.gitkeep
+
+# test docs
+/docs/

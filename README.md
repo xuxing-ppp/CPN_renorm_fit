@@ -4,6 +4,22 @@ This repository contains a new batched PyTorch implementation of the refined
 four-coupling CP(N-1) renormalization pipeline. `legacy/` remains the numerical
 reference and is not imported by the new package.
 
+The pipeline runs **pilot → 1plaq alpha → 2plaq beta/alpha1 → obs beta1 →
+an optional topo alpha correction**. Both plaquette stages sample the complete fine
+action. At fine alpha=0 the equivalent cosine representation avoids sampling
+unconstrained integers. The 2plaq result contains `old` (alpha=0 cosine model,
+beta≥0 and alpha_eff≥0) and `new` (exact Villain conditional density with
+independently fixed 1plaq alpha, beta≥0 and signed alpha1), fitted to identical
+bin-center data. `steps.two_plaq.p0` initializes the old control. The new fit uses
+the old beta with alpha1=0 and alpha1=old alpha_eff as two starts; the latter is
+only an initial value. Only `new` feeds later stages. Its MSE may exceed the old
+control when the independent matching conditions disagree; this never triggers
+a fallback or iteration. `alpha_eff` belongs only to the old control.
+
+Obs uses the full fine action and independent coarse beta, alpha, alpha1, scanning
+only beta1. Topo then fixes beta, alpha1 and each method's matched beta1 and changes
+only alpha. Its final 2plaq MSE is a diagnostic, with no refit or iteration.
+
 ## Running
 
 Activate a Python environment containing PyTorch, NumPy, SciPy and Matplotlib,
@@ -99,11 +115,10 @@ are rejected. At fine `beta1 = 0`, all mods share the pilot and plaquette
 results. At nonzero `beta1`, each mod has its own pilot geometry and common
 stages under `common/mod<mod>/`. Adding `"U"` later reuses the pilot and common
 plaquette batches and preserves the completed z branch. For `model.alpha = 0`,
-the U one-plaquette/topology result is explicitly unavailable because the fine
-integer `s` sector is unconstrained; the U two-plaquette and observable results
-remain available.
+the U branch adopts `alpha_zero_subspace_convention`: alpha=0, no U 1plaq
+identification and no topo correction, while 2plaq and obs continue.
 
-Fitted beta and effective alpha retain full floating-point precision in
+Fitted independent couplings retain full floating-point precision in
 subsequent scans and exported TOML. The final summary includes direct fit
 errors; these do not include propagation of upstream uncertainties.
 
@@ -114,32 +129,36 @@ the CLI prints every changed value and marks each pipeline stage as `reuse`,
 scheduled/non-interactive jobs must pass `--accept-changes`. The `batch`
 command performs this check for all matched files before starting simulations.
 
-It is therefore safe to run first with `alpha_methods = ["1plaq"]`, adjust
-`scan.beta1.points`, `min`, or `max`, and run again. Existing retained beta1
-ensembles are reused, only missing points are simulated, and the latest scan
-result and summary replace the old ones. Adding `"topo"` to `alpha_methods`
-then fills in the topology stage for the accepted beta1 fit. After a successful pipeline run,
+After changing `scan.beta1.points`, `min`, or `max`, compatible retained beta1
+ensembles are reused and missing points are simulated. Every full run estimates
+1plaq alpha before 2plaq, then performs obs and a single topo correction for each
+selected beta1 method when `alpha_topo_fit=true`. After a successful pipeline run,
 initial/coarse-expansion points and points actually used in the final fits are retained as JSON
 measurement caches. Points used only for bisection are removed. Retained points
 are shared by observable methods, and completed fits are cached per method.
 Adding a method runs only its missing fit and measurement work.
 
-Select methods independently in `[renormalization]`:
+Select beta1 matching methods in `[renormalization]`:
 
 ```toml
 beta1_methods = ["magsus", "corrG"]
-alpha_methods = ["1plaq", "topo"]
+alpha_topo_fit = true  # false skips topo; 1plaq always runs
 ```
 
 `corrG` matches the second-moment correlation length `xi_G`, computed from the
 zero and lowest nonzero Fourier modes. The method name distinguishes it from
 a future exponential correlation-length fit.
 
-Empty lists skip those fits and produce `null` for their couplings in the final summary. `topo`
-requires at least one beta1 method and runs once for each selected beta1 method.
-It does not require `1plaq`: without explicit `scan.alpha.points`, its initial
-points are `min`, `min+h`, `min+2h`, where `h=min(0.1, (max-min)/2)`.
-Failed/unavailable selected fits report a null value; reasons remain in the stage JSON.
+1plaq is a required dependency. Both the baseline 1plaq combination and every
+successful topo combination are exported. `alpha_topo_fit` defaults to true.
+When true, topo runs once per selected beta1 method, except for the U alpha=0
+subspace convention. When false, topo sampling, fitting and chain tuning are
+skipped; the 1plaq alpha is used in the final couplings. Empty beta1 methods
+skip obs and topo and leave beta1 null. Explicit `scan.alpha.points` take priority;
+otherwise the initial grid is the 1plaq center and its two neighbors at spacing
+`max(refine_tolerance, fit_spacing_min)`, clipped to min/max. An out-of-range
+center raises an error. Existing expansion and refinement then apply.
+A failed topo correction retains the 1plaq combination and records the reason.
 
 ```toml
 [storage]
@@ -199,8 +218,13 @@ grid construction still follow.
 The top-level `summary.json` contains the input physical parameters, requested
 methods, actual geometry and final branch estimates. Each branch lists complete
 method combinations under `results`: `couplings` groups `beta`, `beta1`, `alpha`,
-`alpha1=alpha_eff-alpha` and `alpha_eff`; `errors` groups the directly fitted
-uncertainties. `renorm_as_fine` exports each complete combination as four TOML
+independent `alpha1`; `errors` groups the directly fitted uncertainties.
+Beta/alpha1 errors are conditional on the fixed 1plaq alpha. Alpha errors belong
+to their own 1plaq or topo stage; there is no whole-pipeline bootstrap.
+`results` always retains the baseline 1plaq combination for each beta1 method,
+and adds successful topo combinations. Both complete combinations are exported;
+a failed topo keeps the baseline export. `topo_correction` records alpha before,
+after, the correction, success, and 2plaq MSE before/after. `renorm_as_fine` exports each complete combination as four TOML
 assignments for the next renormalization step. It is the sole final result file; branches do
 not duplicate it. `resolved.json` owns the effective configuration, actual chain
 widths and shared simulation contexts. `run_state.json` owns command/status and
@@ -272,3 +296,41 @@ couplings before using it.
 The implementation is directly under `cpn_renorm/`, so running
 `python -m cpn_renorm` from the repository root does not require installation
 or a path shim. `pyproject.toml` still supports normal packaging if needed.
+
+
+## Fitting devices and cache compatibility
+
+`runtime.device` controls sampling and plaquette fitting together. CPU uses an
+independent SciPy implementation; CUDA uses a local Torch float64 model,
+analytic Jacobian, bounded damped Gauss–Newton optimizer and covariance algebra.
+No neighboring test project is imported at runtime. Explicit unavailable CUDA or
+out-of-memory errors stop the run, without falling back or reducing budgets.
+Fixed Villain weights are reused; large normalization grids stream bounded blocks,
+with host-backed cached weights when needed. Normalization starts at 256 nodes,
+doubles until relative prediction change <1e-8, and fails at 16384 if unresolved.
+Torch and SciPy run in separate isolated workers; scans, intersections and plots
+remain CPU work. Idle parent CUDA memory is released before a CUDA fit worker.
+Temporary NPZ inputs are deleted when the worker exits. Fit JSON records backend,
+device, convergence, local errors, elapsed worker time (including startup and
+transfer) and peak allocated CUDA memory; tqdm shows stages/iterations.
+Each plaquette stage also writes `fit.log`, including Torch per-iteration MSE,
+damping and projected-gradient diagnostics. Final-alpha normalization is checked
+again without refitting. If raw data must be regenerated on resume, topo records
+the diagnostic data source and evaluates both before/after MSE on that data.
+
+Stage directories are `step1_1plaq`, `step2_2plaq`, `step3_observable`,
+`step4_topo`. Old stage directories remain untouched. Before the first replacement,
+root `summary.json` and `resolved.json` are copied to `summary.legacy.json` and
+`resolved.legacy.json`. Existing runs are not batch-migrated. The legacy JSON
+migration utility only serializes historical results and cannot make folded
+histograms compatible with the new full-action pipeline. New action/fitting/scan
+identities prevent old folded 2plaq and obs/topo reuse; compatible pilot and raw
+1plaq data may be reused. Missing raw data are resampled.
+
+No bin counts were changed for this pipeline. Fits still target bin centers,
+without bin integration or an automatic second bin-resolution stage. Run the
+opt-in verification with `OMP_NUM_THREADS=1 python tests/cuda_smoke.py
+/tmp/cpn-cuda-report.json` in an environment with visible CUDA. It exercises real
+plaquette sampling, isolated CPU/GPU fits and a paired B/2B comparison on the
+same synthetic angle samples. See [verification](docs/verification.md) for the
+measured limitations; production bins are not claimed converged.

@@ -7,23 +7,43 @@ from scipy.optimize import brentq, curve_fit, minimize
 from scipy.special import i0e
 
 
+def one_plaq_probability(X: np.ndarray, alpha: float) -> tuple[np.ndarray, np.ndarray]:
+    from scipy.special import logsumexp
+    X = np.asarray(X, float)
+    da = (X[:, 1] + np.pi) % (2*np.pi) - np.pi
+    energy = .5*(X[:, 1]+2*np.pi*X[:, 0])**2
+    if alpha < .5:
+        n = np.arange(1, max(2, int(np.ceil(np.sqrt(2*alpha*np.log(2e15))))+1))
+        q = np.exp(-n*n/(2*alpha))
+        c = np.cos(da[:,None]*n)
+        weight = 1+2*(c*q).sum(1)
+        lognorm = np.log(weight)-.5*np.log(2*np.pi*alpha)
+        derivative = (c*q*n*n/alpha**2).sum(1)/weight-.5/alpha
+    else:
+        count = max(1,int(np.ceil(np.sqrt(2*np.log(2e15)/alpha)/(2*np.pi)))+1)
+        energies = .5*(da[:,None]+2*np.pi*np.arange(-count,count+1))**2
+        terms = -alpha*energies
+        lognorm = logsumexp(terms,axis=1)
+        derivative = -(np.exp(terms-lognorm[:,None])*energies).sum(1)
+    pred = np.exp(-alpha*energy-lognorm)
+    return pred, pred*(-energy-derivative)
+
+
 def _villain_norm(da: np.ndarray, alpha: float) -> np.ndarray:
-    n_terms = max(int(np.ceil(10 / np.sqrt(max(alpha, 1e-12)))), 10)
-    n = np.arange(-n_terms, n_terms + 1)[:, None]
-    return np.exp(-0.5 * alpha * (2 * np.pi * n + da[None]) ** 2).sum(0)
+    from scipy.special import logsumexp
+    count = max(1,int(np.ceil(np.sqrt(2*np.log(2e15)/alpha)/(2*np.pi)))+1)
+    return np.exp(logsumexp(-.5*alpha*(np.asarray(da)[None,:]+2*np.pi*np.arange(-count,count+1)[:,None])**2,axis=0))
 
 
-def fit_one_plaq(X: np.ndarray, freq: np.ndarray, p0: float = 0.5) -> dict:
-    X, freq = np.asarray(X, float), np.asarray(freq, float)
-
-    def model(x: np.ndarray, alpha: float) -> np.ndarray:
-        s, da = x[:, 0], x[:, 1]
-        return np.exp(-0.5 * alpha * (da + 2 * np.pi * s) ** 2) / _villain_norm(da, alpha)
-
-    popt, pcov = curve_fit(model, X, freq, p0=[p0], bounds=(1e-12, np.inf), maxfev=20000)
-    pred = model(X, *popt)
-    return {"alpha": float(popt[0]), "alpha_err": float(np.sqrt(pcov[0, 0])),
-            "mse": float(np.mean((pred - freq) ** 2))}
+def fit_one_plaq(X: np.ndarray, freq: np.ndarray, p0: float = .5) -> dict:
+    def model(x, alpha): return one_plaq_probability(x, alpha)[0]
+    def jac(x, alpha): return one_plaq_probability(x, alpha)[1][:,None]
+    popt, pcov = curve_fit(model, np.asarray(X,float), np.asarray(freq,float),
+                           p0=[p0], jac=jac, bounds=(1e-12,np.inf),
+                           ftol=1e-11, xtol=1e-11, gtol=1e-12, maxfev=20000)
+    return {'alpha': float(popt[0]), 'alpha_err': float(np.sqrt(pcov[0,0])),
+            'mse': float(np.mean((model(X,*popt)-freq)**2)), 'backend': 'scipy',
+            'device': 'cpu', 'success': True}
 
 
 def fit_two_plaq(N: int, X: np.ndarray, freq: np.ndarray,
@@ -39,7 +59,7 @@ def fit_two_plaq(N: int, X: np.ndarray, freq: np.ndarray,
         # exp(real(UF))/I0(|F|), evaluated without overflow.
         return np.exp(np.real(U * field) - np.abs(field)) / i0e(np.abs(field)) / (2 * np.pi)
 
-    popt, pcov = curve_fit(model, X, freq, p0=p0, bounds=(0, np.inf), maxfev=50000)
+    popt, pcov = curve_fit(model, X, freq, p0=p0, bounds=(0, np.inf), maxfev=50000, ftol=1e-11, xtol=1e-11, gtol=1e-12)
     pred = model(X, *popt)
     return {"beta": float(popt[0]), "beta_err": float(np.sqrt(pcov[0, 0])),
             "alpha_eff": float(popt[1]), "alpha_eff_err": float(np.sqrt(pcov[1, 1])),

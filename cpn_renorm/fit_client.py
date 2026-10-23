@@ -11,17 +11,32 @@ import numpy as np
 
 
 def isolated_fit(operation: str, request: dict, **arrays: np.ndarray) -> dict:
+    import time
+    started = time.perf_counter()
+    if request.get("device", "cpu").startswith("cuda"):
+        import torch
+        torch.cuda.empty_cache()
     worker = Path(__file__).with_name("fit_worker.py")
     with tempfile.TemporaryDirectory(prefix="cpn-fit-") as tmp:
         root = Path(tmp)
         req, data, out = root / "request.json", root / "arrays.npz", root / "result.json"
         req.write_text(json.dumps({"operation": operation, **request}), encoding="utf-8")
         np.savez_compressed(data, **arrays)
+        from tqdm import tqdm
+        progress = tqdm(total=1, desc=f"{operation} {request.get('device', 'cpu')}", leave=False,
+                        disable=operation not in ("one_plaq", "two_fixed"))
         completed = subprocess.run([sys.executable, str(worker), str(req), str(data), str(out)],
-                                   check=False, text=True, capture_output=True)
+                                   check=False, text=True, stdout=subprocess.PIPE)
+        progress.update(1)
+        progress.close()
         if completed.returncode:
-            raise RuntimeError("isolated fit failed:\n" + completed.stdout + completed.stderr)
-        return json.loads(out.read_text(encoding="utf-8"))
+            error = json.loads(out.read_text()) if out.exists() else {}
+            detail = f"{error.get('worker_error', 'worker failure')}: {error.get('message', '')}"
+            raise RuntimeError("isolated fit failed: " + detail + "\n" + completed.stdout)
+        result = json.loads(out.read_text(encoding="utf-8"))
+        if operation in ("one_plaq", "two_fixed"):
+            result["worker_elapsed_seconds"] = time.perf_counter() - started
+        return result
 
 
 def isolated_match(x: np.ndarray, y: np.ndarray, target: float,

@@ -22,10 +22,10 @@ class StorageMethodsTests(unittest.TestCase):
 
     def test_validation(self):
         cfg = self.config()
-        cfg["renormalization"].update(beta1_methods=[], alpha_methods=[])
+        cfg["renormalization"].update(beta1_methods=[])
         validate_config(cfg)
         cfg["renormalization"]["alpha_methods"] = ["topo"]
-        with self.assertRaisesRegex(ValueError, "topo requires"):
+        with self.assertRaisesRegex(ValueError, "obsolete configuration field renormalization.alpha_methods"):
             validate_config(cfg)
         for methods in (["corrG", "corrG"], ["unknown"], "corrG", [False]):
             cfg = self.config()
@@ -55,40 +55,40 @@ class StorageMethodsTests(unittest.TestCase):
                 self.assertAlmostEqual(reused["accept_rate"], 0.8)
                 self.assertEqual(bool(list(Path(tmp).rglob("*.npz"))), enabled)
 
-    def test_empty_methods_skip_stages_and_emit_null(self):
+    def test_empty_methods_still_estimate_independent_alpha(self):
         cfg = self.config()
-        cfg["renormalization"].update(beta1_methods=[], alpha_methods=[])
+        cfg["renormalization"].update(beta1_methods=[])
         geometry = {"padding": 0, "L_fine": 8, "L_coarse": 2, "factor": 4}
         with tempfile.TemporaryDirectory() as tmp, patch(
                 "cpn_renorm.pipeline.run_pilot", return_value={"geometry": geometry}), patch(
-                "cpn_renorm.pipeline._run_two_plaq", return_value={"fits": {"z": {"beta": .6, "alpha_eff": .2}}}), patch(
+                "cpn_renorm.pipeline._run_two_plaq", return_value={"fits": {"z": {"new": {"beta": .6, "alpha1": .2}}}}), patch(
                 "cpn_renorm.pipeline._run_beta1_scan") as obs, patch(
-                "cpn_renorm.pipeline._run_one_plaq") as one, patch(
+                "cpn_renorm.pipeline._run_one_plaq", return_value={"fits": {"z": {"alpha": .1}}}) as one, patch(
                 "cpn_renorm.pipeline._run_topo") as topo:
             result = run_pipeline(cfg, tmp)
             branch = result["branches"]["z_mod1"]
-            self.assertIsNone(branch["results"]["unfitted"]["couplings"]["beta1"])
-            self.assertIsNone(branch["results"]["unfitted"]["couplings"]["alpha"])
+            self.assertIsNone(branch["results"]["1plaq"]["couplings"]["beta1"])
+            self.assertEqual(branch["results"]["1plaq"]["couplings"]["alpha"], .1)
             obs.assert_not_called()
-            one.assert_not_called()
+            one.assert_called_once()
             topo.assert_not_called()
 
-    def test_only_topo_does_not_run_one_plaquette(self):
+    def test_topo_automatically_runs_after_one_plaquette(self):
         cfg = self.config()
-        cfg["renormalization"].update(beta1_methods=["corrG"], alpha_methods=["topo"])
+        cfg["renormalization"].update(beta1_methods=["corrG"])
         geometry = {"padding": 0, "L_fine": 8, "L_coarse": 2, "factor": 4}
         with tempfile.TemporaryDirectory() as tmp, patch(
                 "cpn_renorm.pipeline.run_pilot", return_value={"geometry": geometry}), patch(
-                "cpn_renorm.pipeline._run_two_plaq", return_value={"fits": {"z": {"beta": .6, "alpha_eff": .2}}}), patch(
+                "cpn_renorm.pipeline._run_two_plaq", return_value={"fits": {"z": {"new": {"beta": .6, "alpha1": .2}}}}), patch(
                 "cpn_renorm.pipeline._run_beta1_scan", return_value={"matches": {"corrG": {"value": .3}}}), patch(
-                "cpn_renorm.pipeline._run_one_plaq") as one, patch(
+                "cpn_renorm.pipeline._run_one_plaq", return_value={"fits": {"z": {"alpha": .1}}}) as one, patch(
                 "cpn_renorm.pipeline._run_topo", return_value={"matches": {"corrG": {"value": .1}}}) as topo:
             result = run_pipeline(cfg, tmp)
-            one.assert_not_called()
+            one.assert_called_once()
             topo.assert_called_once()
-            self.assertEqual(set(result["branches"]["z_mod1"]["results"]), {"corrG_obs_fit_topo"})
-        points = _default_alpha_points(123., cfg["scan"]["alpha"])
-        self.assertEqual(points[0], cfg["scan"]["alpha"]["min"])
+            self.assertEqual(set(result["branches"]["z_mod1"]["results"]), {"corrG_1plaq"})
+        with self.assertRaisesRegex(ValueError, "outside scan range"):
+            _default_alpha_points(123., cfg["scan"]["alpha"])
 
     def test_adding_method_reuses_old_fit_and_coarse_points(self):
         cfg = self.config()
@@ -120,7 +120,7 @@ class StorageMethodsTests(unittest.TestCase):
             self.assertEqual(sample.call_count, sampled)
             self.assertEqual(second["matches"]["magsus"], cached_fit)
             self.assertEqual(set(second["matches"]), {"magsus", "corrG"})
-            stored = read_json(directory / "step2_observable/result.json")
+            stored = read_json(directory / "step3_observable/result.json")
             values, phases = scan_measurements(directory, stored)
             self.assertTrue({-.1, 0., .1}.issubset(values))
             self.assertIn("coarse", phases[-.1])
