@@ -97,9 +97,9 @@ class ConfigTests(unittest.TestCase):
     def test_patch_fit_counts_match_reference(self):
         cfg = load_config(Path(__file__).parents[1] / "configs" / "example.toml")
         self.assertEqual(cfg["steps"]["two_plaq"]["fit_times"], 5000)
-        self.assertEqual(cfg["steps"]["two_plaq"]["min_meas_per_boundary"], 3000)
+        self.assertEqual(cfg["steps"]["two_plaq"]["min_meas_per_boundary"], 4096)
         self.assertEqual(cfg["steps"]["one_plaq"]["fit_times"], 3000)
-        self.assertEqual(cfg["steps"]["one_plaq"]["min_meas_per_boundary"], 1000)
+        self.assertEqual(cfg["steps"]["one_plaq"]["min_meas_per_boundary"], 2048)
         self.assertEqual(cfg["scan"]["beta1"]["refine_tolerance"], 0.02)
         self.assertEqual(cfg["scan"]["alpha"]["refine_tolerance"], 0.002)
         self.assertEqual(cfg["scan"]["beta1"]["fit_points"], 5)

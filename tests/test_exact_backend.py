@@ -147,7 +147,7 @@ class ExactNumericsTests(unittest.TestCase):
         with patch('cpn_renorm.pipeline.resolve_device',return_value='cuda'):
             self.assertNotEqual(key,_two_fit_key(cfg,{},one))
 
-    def test_pipeline_order_archives_legacy_once_and_keeps_old_stages(self):
+    def test_pipeline_order_updates_outputs_without_archives(self):
         import json
         from cpn_renorm.pipeline import run_pipeline
         cfg=load_config(ROOT/'configs/example.toml')
@@ -165,17 +165,15 @@ class ExactNumericsTests(unittest.TestCase):
             return {'fits':{'z':{'old':{'alpha_eff':.1},'new':{'beta':.6,'alpha1':-.1}}}}
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)/'example'; root.mkdir()
-            old_resolved={'contexts':{},'config':{'old':True}}
-            (root/'resolved.json').write_text(json.dumps(old_resolved))
-            (root/'summary.json').write_text('{"old":true}')
-            old_stage=root/'step1_2plaq';old_stage.mkdir()
-            (old_stage/'result.json').write_text('{"legacy":true}')
             with patch('cpn_renorm.pipeline.run_pilot',side_effect=pilot), patch('cpn_renorm.pipeline._run_one_plaq',side_effect=one), patch('cpn_renorm.pipeline._run_two_plaq',side_effect=two):
                 run_pipeline(cfg,tmp)
                 self.assertEqual(events,['pilot','one','two'])
-                snapshot=(root/'summary.legacy.json').read_bytes()
+                first_summary=json.loads((root/'summary.json').read_text())
+                first_resolved=json.loads((root/'resolved.json').read_text())
                 run_pipeline(cfg,tmp)
-            self.assertEqual((root/'summary.legacy.json').read_bytes(),snapshot)
-            self.assertEqual(json.loads((root/'resolved.legacy.json').read_text()),old_resolved)
-            self.assertEqual((old_stage/'result.json').read_text(),'{"legacy":true}')
+            self.assertEqual(json.loads((root/'summary.json').read_text()),first_summary)
+            self.assertEqual(json.loads((root/'resolved.json').read_text()),first_resolved)
+            self.assertNotIn('pipeline_revision',first_summary)
+            self.assertNotIn('pipeline_revision',first_resolved)
+            self.assertFalse(list(root.glob('*.legacy.json')))
             self.assertFalse(list(root.rglob('*.npz')))

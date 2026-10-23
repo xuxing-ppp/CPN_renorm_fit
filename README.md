@@ -5,7 +5,9 @@ four-coupling CP(N-1) renormalization pipeline. `legacy/` remains the numerical
 reference and is not imported by the new package.
 
 The pipeline runs **pilot → 1plaq alpha → 2plaq beta/alpha1 → obs beta1 →
-an optional topo alpha correction**. Both plaquette stages sample the complete fine
+an optional topo alpha correction → 2plaq beta/alpha1 refit at the corrected alpha**.
+The refit runs only after a successful topo match and reuses the original 2plaq
+data. Both plaquette stages sample the complete fine
 action. At fine alpha=0 the equivalent cosine representation avoids sampling
 unconstrained integers. The 2plaq result contains `old` (alpha=0 cosine model,
 beta≥0 and alpha_eff≥0) and `new` (exact Villain conditional density with
@@ -18,7 +20,9 @@ a fallback or iteration. `alpha_eff` belongs only to the old control.
 
 Obs uses the full fine action and independent coarse beta, alpha, alpha1, scanning
 only beta1. Topo then fixes beta, alpha1 and each method's matched beta1 and changes
-only alpha. Its final 2plaq MSE is a diagnostic, with no refit or iteration.
+only alpha. A final 2plaq fit then adjusts beta and alpha1 at that fixed alpha,
+without further beta1 or alpha scans. Observable/topo matching is not rechecked
+after this final adjustment; the result is a single sequential correction.
 
 ## Running
 
@@ -122,6 +126,15 @@ Fitted independent couplings retain full floating-point precision in
 subsequent scans and exported TOML. The final summary includes direct fit
 errors; these do not include propagation of upstream uncertainties.
 
+Each `summary.json` branch (`<type>_mod<mod>`) contains one
+`two_plaq_comparison`: `old_alpha_eff`, `new_alpha_plus_alpha1`, and their signed
+`difference` (new sum minus old alpha_eff), all from the initial 2plaq stage.
+The `*_1plaq` results retain the initial couplings; `*_obs_fit_topo` results and
+their exported TOML use the final refitted beta/alpha1. Only topo results include
+`topo_correction`, containing signed `alpha`, `beta`, and `alpha1` changes relative
+to the corresponding 1plaq result. Final beta/alpha1 errors are conditional on the
+fixed topo alpha. Detailed fit and MSE diagnostics live in `step4_topo/result.json`.
+
 The workspace records the last accepted effective configuration, including
 defaults and command-line device/seed overrides. If the configuration changes,
 the CLI prints every changed value and marks each pipeline stage as `reuse`,
@@ -219,12 +232,14 @@ The top-level `summary.json` contains the input physical parameters, requested
 methods, actual geometry and final branch estimates. Each branch lists complete
 method combinations under `results`: `couplings` groups `beta`, `beta1`, `alpha`,
 independent `alpha1`; `errors` groups the directly fitted uncertainties.
-Beta/alpha1 errors are conditional on the fixed 1plaq alpha. Alpha errors belong
+Beta/alpha1 errors are conditional on the fixed alpha from the corresponding
+1plaq or topo stage. Alpha errors belong
 to their own 1plaq or topo stage; there is no whole-pipeline bootstrap.
 `results` always retains the baseline 1plaq combination for each beta1 method,
 and adds successful topo combinations. Both complete combinations are exported;
-a failed topo keeps the baseline export. `topo_correction` records alpha before,
-after, the correction, success, and 2plaq MSE before/after. `renorm_as_fine` exports each complete combination as four TOML
+a failed topo keeps the baseline export. Only topo combinations include
+`topo_correction`, with the signed alpha/beta/alpha1 changes; stage files own the
+MSE diagnostics and full refit records. `renorm_as_fine` exports each complete combination as four TOML
 assignments for the next renormalization step. It is the sole final result file; branches do
 not duplicate it. `resolved.json` owns the effective configuration, actual chain
 widths and shared simulation contexts. `run_state.json` owns command/status and
@@ -314,14 +329,22 @@ Temporary NPZ inputs are deleted when the worker exits. Fit JSON records backend
 device, convergence, local errors, elapsed worker time (including startup and
 transfer) and peak allocated CUDA memory; tqdm shows stages/iterations.
 Each plaquette stage also writes `fit.log`, including Torch per-iteration MSE,
-damping and projected-gradient diagnostics. Final-alpha normalization is checked
-again without refitting. If raw data must be regenerated on resume, topo records
-the diagnostic data source and evaluates both before/after MSE on that data.
+damping and projected-gradient diagnostics. After topo matching, the pipeline
+checks the MSE with only alpha changed, then refits beta/alpha1 at the new alpha
+with the same normalization convergence checks. Each successful method's refit
+and its cache identity are saved in `step4_topo/result.json` independently of the
+observable/topo scan cache. If raw data must be regenerated on resume, topo records
+the data source and evaluates the initial, alpha-only and refitted MSE on that data.
+Compatible persisted 2plaq data carry a sampling identity; untagged or stale files
+are regenerated when needed. With `save_npz=false`, fresh 2plaq data stay in memory
+until all related branches finish, and an existing aggregate NPZ is deleted only
+after the run succeeds. No new persistent raw cache is created. A resumed or
+expanded run can therefore require sampling again if a refit is missing and its
+raw data were deleted. With `save_npz=true`, raw NPZ files remain available.
 
 Stage directories are `step1_1plaq`, `step2_2plaq`, `step3_observable`,
-`step4_topo`. Old stage directories remain untouched. Before the first replacement,
-root `summary.json` and `resolved.json` are copied to `summary.legacy.json` and
-`resolved.legacy.json`. Existing runs are not batch-migrated. The legacy JSON
+`step4_topo`. Root `summary.json` and `resolved.json` are updated directly,
+without automatic archive copies. Existing runs are not batch-migrated. The legacy JSON
 migration utility only serializes historical results and cannot make folded
 histograms compatible with the new full-action pipeline. New action/fitting/scan
 identities prevent old folded 2plaq and obs/topo reuse; compatible pilot and raw

@@ -1,6 +1,7 @@
 import tempfile
 import tomllib
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ def load_config(path):
     cfg["runtime"]["auto_chains"] = False
     return cfg
 from cpn_renorm.pipeline import (_censored_xi_G_bracket, _dynamic_fit_spacing,
+                                 _finish_topo, _two_raw_key,
                                  _grid_significantly_brackets,
                                  _remove_scan_ensembles, _run_beta1_scan,
                                  _run_one_plaq, _run_topo, _run_two_plaq,
@@ -26,6 +28,188 @@ ROOT = Path(__file__).parents[1]
 def raw_placeholder():
     return {f"{key}_{tag}": np.ones((1,9)) if key == "X" else np.ones(1)
             for key in ("X", "freq") for tag in ("U", "z")}
+
+
+class TopoRefitTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = load_config(ROOT / "configs" / "example.toml")
+        self.cfg["runtime"]["device"] = "cpu"
+        self.cfg["model"].update(mod=[0, 1], alpha=.1)
+        self.cfg["renormalization"]["type"] = ["z", "U"]
+        self.geometry = {"padding": 0, "L_fine": 8, "L_coarse": 2, "factor": 4}
+        self.two = {"fingerprint": "initial-fit", "fits": {
+            tag: {"old": {"alpha_eff": .25}, "new": {
+                "beta": .6, "alpha": .1, "alpha1": .2, "mse": .01,
+                "beta_err": .02, "alpha1_err": .03}}
+            for tag in ("z", "U")}}
+        self.one = {"fits": {tag: {"alpha": .1, "alpha_err": .01} for tag in ("z", "U")}}
+        self.topo = {"matches": {method: {"value": alpha, "error": .015,
+                                        "bracketed": True}
+                                 for method, alpha in (("magsus", .2), ("corrG", .4))}}
+        self.common = {"two_plaq": self.two, "raw": raw_placeholder(), "raw_source": "current_fit"}
+
+    @staticmethod
+    def fake_fit(operation, request, **_arrays):
+        if operation == "two_mse":
+            return {"mse": .02, "normalization_nodes": 512}
+        alpha = request["alpha"]
+        return {"new": {"beta": .6 + alpha, "alpha": alpha, "alpha1": .2 - alpha,
+                        "mse": .005, "success": True, "beta_err": .004,
+                        "alpha1_err": .006}}
+
+    def finish(self, folder, topo=None):
+        _finish_topo(self.cfg, Path(folder) / "branch", Path(folder), self.geometry,
+                     self.common, self.topo if topo is None else topo, "z", .1)
+
+    def test_each_method_refits_and_resume_needs_no_raw(self):
+        from cpn_renorm.cache import read_json
+        with tempfile.TemporaryDirectory() as folder, patch(
+                "cpn_renorm.pipeline.isolated_fit", side_effect=self.fake_fit) as fit, patch(
+                "cpn_renorm.pipeline.generate_two_plaq") as generate:
+            self.finish(folder)
+            self.assertEqual(fit.call_count, 4)
+            self.assertEqual([c.args[1]["alpha"] for c in fit.call_args_list
+                              if c.args[0] == "two_fixed"], [.2, .4])
+            stored = read_json(Path(folder) / "branch/step4_topo/result.json")
+            self.common["raw"] = None
+            fit.reset_mock()
+            self.finish(folder, stored)
+            fit.assert_not_called()
+            generate.assert_not_called()
+            # Changing only one matched alpha refits only that method.
+            self.common["raw"] = raw_placeholder()
+            stored["matches"]["corrG"]["value"] = .5
+            self.finish(folder, stored)
+            self.assertEqual(fit.call_count, 2)
+
+    def test_invalidates_on_raw_settings_type_device_and_initial_fit(self):
+        with tempfile.TemporaryDirectory() as folder, patch(
+                "cpn_renorm.pipeline.isolated_fit", side_effect=self.fake_fit) as fit:
+            self.finish(folder)
+            for change in (lambda: self.cfg["steps"]["two_plaq"].update(bins=64),
+                           lambda: self.cfg["steps"]["two_plaq"]["p0"].update(z=[1., .1]),
+                           lambda: self.two.update(fingerprint="replacement-fit"),
+                           lambda: self.cfg["runtime"].update(device="cuda")):
+                change()
+                fit.reset_mock()
+                with patch("cpn_renorm.pipeline.resolve_device", return_value=self.cfg["runtime"]["device"]):
+                    self.finish(folder)
+                self.assertEqual(fit.call_count, 4)
+            fit.reset_mock()
+            with patch("cpn_renorm.pipeline.resolve_device", return_value="cuda"):
+                _finish_topo(self.cfg, Path(folder) / "branch", Path(folder), self.geometry,
+                             self.common, self.topo, "U", .1)
+            self.assertEqual(fit.call_count, 4)
+
+    def test_loads_only_compatible_persisted_data_and_regenerates_once(self):
+        from cpn_renorm.storage import atomic_npz
+        for compatible in (True, False):
+            with self.subTest(compatible=compatible), tempfile.TemporaryDirectory() as folder:
+                self.common["raw"] = None
+                topo = deepcopy(self.topo)
+                path = Path(folder) / "step2_2plaq/measurements.npz"
+                raw = raw_placeholder()
+                atomic_npz(path, **raw, two_plaq_raw_key=np.asarray(
+                    _two_raw_key(self.cfg, self.geometry) if compatible else "stale"))
+                with patch("cpn_renorm.pipeline.isolated_fit", side_effect=self.fake_fit) as fit, patch(
+                        "cpn_renorm.pipeline.generate_two_plaq", return_value=raw) as generate:
+                    self.finish(folder, topo)
+                self.assertEqual(generate.call_count, 0 if compatible else 1)
+                self.assertEqual(fit.call_count, 4 if compatible else 6)
+                source = "persisted_measurements" if compatible else "regenerated_measurements"
+                for match in topo["matches"].values():
+                    self.assertEqual(match["two_plaq_refit"]["data_source"], source)
+                    self.assertEqual(match["two_plaq_mse_before"], .01 if compatible else .02)
+                self.assertTrue(path.exists())  # Cleanup belongs to the successful full pipeline.
+
+    def test_failed_or_missing_topo_does_not_fit(self):
+        with tempfile.TemporaryDirectory() as folder, patch(
+                "cpn_renorm.pipeline.isolated_fit") as fit, patch(
+                "cpn_renorm.pipeline.generate_two_plaq") as generate:
+            self.finish(folder, {"matches": {}})
+            self.finish(folder, {"matches": {"magsus": {"bracketed": False, "value": None}}})
+            fit.assert_not_called()
+            generate.assert_not_called()
+
+    def test_refit_failure_is_not_published_as_success(self):
+        def fail(operation, request, **arrays):
+            result = self.fake_fit(operation, request, **arrays)
+            if operation == "two_fixed":
+                result["new"]["success"] = False
+            return result
+        with tempfile.TemporaryDirectory() as folder, patch(
+                "cpn_renorm.pipeline.isolated_fit", side_effect=fail):
+            with self.assertRaisesRegex(RuntimeError, "topo 2plaq refit failed"):
+                self.finish(folder)
+            self.assertNotIn("two_plaq_refit", self.topo["matches"]["magsus"])
+            self.assertFalse((Path(folder) / "branch/step4_topo/result.json").exists())
+
+    def test_initial_fit_keeps_raw_until_refits_and_does_not_delete_existing_file(self):
+        from cpn_renorm.storage import atomic_npz
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            path = root / "step2_2plaq/measurements.npz"
+            atomic_npz(path, marker=np.asarray("existing"))
+            raw = PipelineWorkspaceTests._patch_raw()
+            with patch("cpn_renorm.pipeline.generate_two_plaq", return_value=raw) as generate, patch(
+                    "cpn_renorm.pipeline.isolated_fit", side_effect=self.fake_fit):
+                two = _run_two_plaq(self.cfg, root, self.geometry, self.one)
+                self.assertTrue(path.exists())
+                self.common.update(two_plaq=two, raw=self.cfg.pop("_two_raw"))
+                self.finish(folder)
+                generate.assert_called_once()
+            self.assertIs(self.common["raw"], raw)
+            with np.load(path) as stored:
+                self.assertEqual(str(stored["marker"]), "existing")
+
+    def test_pipeline_shares_data_and_exports_compact_summary(self):
+        scan = {"matches": {method: {"value": .3, "error": .01, "bracketed": True}
+                             for method in ("magsus", "corrG")}}
+        for beta1 in (0., .1):
+            for save_npz in (False, True):
+                with self.subTest(beta1=beta1, save_npz=save_npz), tempfile.TemporaryDirectory() as folder:
+                    self.cfg["model"]["beta1"] = beta1
+                    self.cfg["storage"]["save_npz"] = save_npz
+                    # An existing stale aggregate survives until successful completion.
+                    from cpn_renorm.storage import atomic_npz
+                    root = Path(folder) / "example"
+                    common_dirs = [root] if beta1 == 0 else [root / "common" / f"mod{m}" for m in (0, 1)]
+                    for common_dir in common_dirs:
+                        atomic_npz(common_dir / "step2_2plaq/measurements.npz", stale=np.asarray(True))
+                    with patch("cpn_renorm.pipeline.run_pilot", return_value={"geometry": self.geometry}), patch(
+                            "cpn_renorm.pipeline._run_one_plaq", return_value=self.one), patch(
+                            "cpn_renorm.pipeline._run_two_plaq", return_value=self.two), patch(
+                            "cpn_renorm.pipeline._run_beta1_scan", return_value=scan) as beta_scan, patch(
+                            "cpn_renorm.pipeline._run_topo", side_effect=lambda *a, **kw: deepcopy(self.topo)) as topo_scan, patch(
+                            "cpn_renorm.pipeline.generate_two_plaq", side_effect=lambda *a, **kw: raw_placeholder()) as generate, patch(
+                            "cpn_renorm.pipeline.isolated_fit", side_effect=self.fake_fit):
+                        summary = run_pipeline(self.cfg, folder)
+                    self.assertEqual(generate.call_count, 1 if beta1 == 0 else 2)
+                    self.assertEqual(beta_scan.call_count, 4)
+                    self.assertEqual(topo_scan.call_count, 4)
+                    self.assertEqual(len(summary["branches"]), 4)
+                    for branch in summary["branches"].values():
+                        comparison = branch["two_plaq_comparison"]
+                        self.assertEqual(comparison["old_alpha_eff"], .25)
+                        self.assertAlmostEqual(comparison["new_alpha_plus_alpha1"], .3)
+                        self.assertAlmostEqual(comparison["difference"], .05)
+                        for method, alpha in (("magsus", .2), ("corrG", .4)):
+                            original = branch["results"][method + "_1plaq"]
+                            final = branch["results"][method + "_obs_fit_topo"]
+                            self.assertNotIn("topo_correction", original)
+                            self.assertEqual(final["errors"]["beta"], .004)
+                            self.assertEqual(final["errors"]["alpha1"], .006)
+                            self.assertEqual(final["error_scope"], "beta_and_alpha1_conditional_on_topo_alpha")
+                            self.assertEqual(set(final["topo_correction"]), {"alpha", "beta", "alpha1"})
+                            for name in ("alpha", "beta", "alpha1"):
+                                self.assertAlmostEqual(final["topo_correction"][name],
+                                    final["couplings"][name] - original["couplings"][name])
+                            self.assertAlmostEqual(final["couplings"]["alpha"], alpha)
+                            self.assertAlmostEqual(final["couplings"]["beta"], .6 + alpha)
+                            self.assertEqual(tomllib.loads(branch["renorm_as_fine"][method + "_obs_fit_topo"]),
+                                             final["couplings"])
+                    files = list(Path(folder).rglob("measurements.npz"))
+                    self.assertEqual(len(files), (1 if beta1 == 0 else 2) if save_npz else 0)
 
 
 class PipelineWorkspaceTests(unittest.TestCase):
@@ -134,7 +318,9 @@ class PipelineWorkspaceTests(unittest.TestCase):
                 "cpn_renorm.pipeline._run_beta1_scan", return_value=scan) as run_beta, patch(
                 "cpn_renorm.pipeline._run_topo", return_value=topo) as run_topo, patch(
                 "cpn_renorm.pipeline.generate_two_plaq", return_value=raw_placeholder()), patch(
-                "cpn_renorm.pipeline.isolated_fit", return_value={"mse": .01}):
+                "cpn_renorm.pipeline.isolated_fit", side_effect=lambda op, req, **kw:
+                {"new": {"beta": .65, "alpha": req["alpha"], "alpha1": .22,
+                         "success": True, "mse": .009}} if op == "two_fixed" else {"mse": .01}):
             summary = run_pipeline(cfg, Path(folder))
         run_two.assert_called_once()
         run_one.assert_called_once()

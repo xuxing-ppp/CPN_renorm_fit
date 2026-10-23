@@ -17,6 +17,7 @@ from cpn_renorm.fit_client import isolated_fit
 from cpn_renorm.exact_fitting import Conditional
 from cpn_renorm.torch_fitting import Conditional as GPUConditional, OnePlaquette
 from cpn_renorm.fitting import one_plaq_probability
+from cpn_renorm.pipeline import _finish_topo
 
 
 def main(destination):
@@ -34,7 +35,8 @@ def main(destination):
             min_meas_per_boundary=64,max_meas_per_boundary=128,target_ess_per_boundary=10.)
     cfg['hmc'].update(adapt_steps=8)
     geometry={'padding':1,'factor':2,'L_fine':8,'L_coarse':4}
-    report={'device':torch.cuda.get_device_name(0),'torch':torch.__version__,'sampling':{},'fits':{}}
+    report={'device':torch.cuda.get_device_name(0),'torch':torch.__version__,
+            'dtype':'float64','sampling':{},'fits':{},'topo_refits':{}}
     with tempfile.TemporaryDirectory() as tmp:
         for stage,generate in (('one_plaq',generate_one_plaq),('two_plaq',generate_two_plaq)):
             t=time.perf_counter()
@@ -79,6 +81,21 @@ def main(destination):
                     del model
                 pair['cpu']['same_parameter_density_max_difference'] = same_prediction_delta
                 report['fits'][stage+'_'+tag]={'cpu':cpu,'cuda':gpu,**({} if stage=='one_plaq' else {'max_prediction_difference':pair['max_prediction_difference']})}
+            if stage == 'two_plaq':
+                for tag in ('U', 'z'):
+                    initial = report['fits']['two_plaq_'+tag]['cuda']
+                    alpha_before = report['fits']['one_plaq_'+tag]['cpu']['alpha']
+                    topo = {'matches': {'smoke': {'value': alpha_before * 1.1,
+                                                 'error': .01, 'bracketed': True}}}
+                    common = {'two_plaq': {'fits': {tag: initial}},
+                              'raw': raw, 'raw_source': 'current_fit'}
+                    _finish_topo(cfg, Path(tmp)/('refit_'+tag), Path(tmp), geometry,
+                                 common, topo, tag, alpha_before)
+                    match = topo['matches']['smoke']
+                    final = match['two_plaq_refit']['fit']['new']
+                    assert final['success']
+                    assert final['mse'] <= match['two_plaq_mse_after'] + 1e-10
+                    report['topo_refits'][tag] = match
     # Same generated angle samples, grouped into B and 2B histograms.
     rng=np.random.default_rng(20261022)
     boundaries=rng.uniform(-np.pi,np.pi,(6,8));boundaries[:,6]=.6

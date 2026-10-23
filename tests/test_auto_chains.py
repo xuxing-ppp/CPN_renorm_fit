@@ -225,7 +225,9 @@ class AutoChainsTests(unittest.TestCase):
                         "cpn_renorm.pipeline.generate_two_plaq", return_value={
                             f"{key}_{tag}": np.ones((1,9)) if key == "X" else np.ones(1)
                             for key in ("X", "freq") for tag in ("U", "z")}), patch(
-                        "cpn_renorm.pipeline.isolated_fit", return_value={"mse": .01}):
+                        "cpn_renorm.pipeline.isolated_fit", side_effect=lambda op, req, **kw:
+                        {"new": {**fit2, "alpha": req["alpha"], "success": True}}
+                        if op == "two_fixed" else {"mse": .01}):
                     summary = run_pipeline(cfg, folder)
                     self.assertEqual(p.call_count, expected_common_calls)
                     self.assertEqual(t.call_count, expected_common_calls)
