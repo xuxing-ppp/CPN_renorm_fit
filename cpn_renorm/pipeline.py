@@ -863,7 +863,7 @@ def _branch_summary(cfg: dict, run_name: str, renorm_type: str, geometry: dict,
                     step2: dict, topo: dict, *, fit2: dict | None = None,
                     fit1: dict | None = None) -> dict:
     fit2, fit1 = fit2 or {}, fit1 or {}
-    results, fragments = {}, {}
+    results = {}
     for method in cfg["renormalization"]["beta1_methods"] or [None]:
         beta_match = step2.get("matches", {}).get(method, {})
         baseline = {"beta": beta_c, "beta1": beta_match.get("value"),
@@ -887,9 +887,7 @@ def _branch_summary(cfg: dict, run_name: str, renorm_type: str, geometry: dict,
             if suffix == "obs_fit_topo":
                 results[name]["topo_correction"] = {
                     key: couplings[key] - baseline[key] for key in ("alpha", "beta", "alpha1")}
-            if all(value is not None for value in couplings.values()):
-                fragments[name] = "\n".join(f"{key} = {value!r}" for key,value in couplings.items())
-    return {"results": results, "renorm_as_fine": fragments}
+    return {"results": results}
 
 
 def _run_mod_pipeline(cfg: dict, output_root: str | Path) -> dict:

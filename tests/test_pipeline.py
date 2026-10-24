@@ -1,5 +1,4 @@
 import tempfile
-import tomllib
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -206,8 +205,7 @@ class TopoRefitTests(unittest.TestCase):
                                     final["couplings"][name] - original["couplings"][name])
                             self.assertAlmostEqual(final["couplings"]["alpha"], alpha)
                             self.assertAlmostEqual(final["couplings"]["beta"], .6 + alpha)
-                            self.assertEqual(tomllib.loads(branch["renorm_as_fine"][method + "_obs_fit_topo"]),
-                                             final["couplings"])
+                            self.assertNotIn("renorm_as_fine", branch)
                     files = list(Path(folder).rglob("measurements.npz"))
                     self.assertEqual(len(files), (1 if beta1 == 0 else 2) if save_npz else 0)
 
@@ -289,8 +287,9 @@ class PipelineWorkspaceTests(unittest.TestCase):
             branch = summary["branches"]["z_mod1"]
             self.assertEqual(branch["results"]["magsus_1plaq"]["couplings"]["beta"], 0.6)
             self.assertEqual(branch["results"]["magsus_1plaq"]["couplings"]["alpha"], 0.1)
-            exported = tomllib.loads(branch["renorm_as_fine"]["magsus_1plaq"])
-            self.assertEqual(exported, {"beta": .6, "beta1": .3, "alpha": .1, "alpha1": .2})
+            self.assertNotIn("renorm_as_fine", branch)
+            self.assertEqual(branch["results"]["magsus_1plaq"]["couplings"],
+                             {"beta": .6, "beta1": .3, "alpha": .1, "alpha1": .2})
             self.assertEqual(set(branch["results"]["magsus_1plaq"]["couplings"]),
                              {"beta", "beta1", "alpha", "alpha1"})
             self.assertNotIn("fit_points", branch)

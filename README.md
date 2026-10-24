@@ -130,7 +130,7 @@ Each `summary.json` branch (`<type>_mod<mod>`) contains one
 `two_plaq_comparison`: `old_alpha_eff`, `new_alpha_plus_alpha1`, and their signed
 `difference` (new sum minus old alpha_eff), all from the initial 2plaq stage.
 The `*_1plaq` results retain the initial couplings; `*_obs_fit_topo` results and
-their exported TOML use the final refitted beta/alpha1. Only topo results include
+generated next-step TOML use the final refitted beta/alpha1. Only topo results include
 `topo_correction`, containing signed `alpha`, `beta`, and `alpha1` changes relative
 to the corresponding 1plaq result. Final beta/alpha1 errors are conditional on the
 fixed topo alpha. Detailed fit and MSE diagnostics live in `step4_topo/result.json`.
@@ -236,17 +236,60 @@ Beta/alpha1 errors are conditional on the fixed alpha from the corresponding
 1plaq or topo stage. Alpha errors belong
 to their own 1plaq or topo stage; there is no whole-pipeline bootstrap.
 `results` always retains the baseline 1plaq combination for each beta1 method,
-and adds successful topo combinations. Both complete combinations are exported;
-a failed topo keeps the baseline export. Only topo combinations include
+and adds successful topo combinations. A failed topo keeps the baseline result.
+Only topo combinations include
 `topo_correction`, with the signed alpha/beta/alpha1 changes; stage files own the
-MSE diagnostics and full refit records. `renorm_as_fine` exports each complete combination as four TOML
-assignments for the next renormalization step. It is the sole final result file; branches do
+MSE diagnostics and full refit records. Next-step configurations are generated from
+`results` using the script below; `renorm_as_fine` is no longer emitted.
+`summary.json` is the sole final result file; branches do
 not duplicate it. `resolved.json` owns the effective configuration, actual chain
 widths and shared simulation contexts. `run_state.json` owns command/status and
 configuration identity. Each ensemble JSON owns its scalar measurements;
 stage JSON files reference those ensembles and keep fit/search diagnostics,
 including cached methods that are no longer selected. Only selected methods
 appear in the final summary.
+
+### Generate the next renormalization configuration
+
+Edit the parameter block at the top of `configs/next_config.py`, then run:
+
+```bash
+python configs/next_config.py
+```
+
+Install the project dependencies first (`python -m pip install -e ".[test]"`);
+the generator uses `tomli-w` to write TOML. The script runs directly from the
+source checkout and resolves paths independently of the current working directory.
+`SOURCE` is a unique run directory name searched recursively under the project's
+`runs/`, an absolute run directory, or a directory path relative to the project root.
+Ambiguous names require an explicit path. `OUTPUT_DIR` is relative to `configs/`
+unless absolute; parent directories are created. `OUTPUT_FILENAME` is optional:
+leave it empty or set it to `None` to use
+`<source-run-name>-L<factor>_mod<mod>_<beta_method>_<alpha_method>.toml`.
+For the supplied parameters this is
+`N2_L2_b1.0-L2_mod0_corrG_topo.toml`. Custom names must not contain a
+directory path; the `.toml` extension is added if omitted. Existing files require
+`OVERWRITE = True`.
+
+Set `MOD`, `TYPE`, `BETA_METHOD`, `ALPHA_METHOD`, and `FACTOR` explicitly.
+For example, the supplied parameters select `z_mod0 / corrG_obs_fit_topo` from
+`N2_L2_b1.0`. N and all four final couplings come from `summary.json`, including
+the refitted beta/alpha1 for topo. The next configuration uses `model.mod = [MOD]`,
+`beta1_methods = [BETA_METHOD]`, and the specified blocking `FACTOR`.
+`ALPHA_METHOD = "topo"` enables the next topo fit; `"1plaq"` disables it.
+`TYPE` selects only the source branch. `NEXT_TYPE` controls the next run and
+defaults to `"U"`.
+
+Other settings inherit `resolved.json.config`, falling back to `input.toml` and
+configuration defaults when the saved config is absent. Measured geometries and
+branch tuning records are not copied. `OVERRIDES` accepts existing dotted field
+names and Python values, for example `{"runtime.device": "cpu"}`; model fields
+and fields controlled by dedicated parameters cannot be overridden there.
+The generated configuration is validated before writing. Missing results or
+invalid couplings raise errors without falling back to other methods.
+Generation does not start a simulation; run the resulting TOML normally, and
+use that run as `SOURCE` for another step. Older summaries containing
+`renorm_as_fine` remain readable; the generator ignores that field.
 
 To migrate existing active runs, inspect then apply:
 

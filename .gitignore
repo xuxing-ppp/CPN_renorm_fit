@@ -15,6 +15,7 @@ __pycache__/
 # config files and run results
 /configs/*
 !/configs/example.toml
+!/configs/next_config.py
 /runs/*
 !/runs/.gitkeep
 

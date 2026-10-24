@@ -35,7 +35,7 @@ def _branch_summary(cfg: dict, run_name: str, renorm_type: str, geometry: dict,
     fit2, fit1 = fit2 or {}, fit1 or {}
     beta_methods = cfg["renormalization"]["beta1_methods"]
     alpha_methods = cfg["renormalization"].get("alpha_methods", ("1plaq", "topo"))
-    results, fragments = {}, {}
+    results = {}
     for beta_method in beta_methods or [None]:
         beta_match = step2.get("matches", {}).get(beta_method, {})
         for alpha_method in alpha_methods or [None]:
@@ -55,10 +55,7 @@ def _branch_summary(cfg: dict, run_name: str, renorm_type: str, geometry: dict,
             errors = {"beta": fit2.get("beta_err"), "beta1": beta_match.get("error"),
                       "alpha": alpha_err, "alpha_eff": fit2.get("alpha_eff_err")}
             results[name] = {"couplings": couplings, "errors": errors}
-            if all(couplings[key] is not None for key in ("beta", "beta1", "alpha", "alpha1")):
-                fragments[name] = "\n".join(f"{key} = {couplings[key]!r}"
-                                            for key in ("beta", "beta1", "alpha", "alpha1"))
-    return {"results": results, "renorm_as_fine": fragments}
+    return {"results": results}
 
 
 def _require(condition: bool, detail: object) -> None:
