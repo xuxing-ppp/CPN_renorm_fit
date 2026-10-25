@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from copy import deepcopy
@@ -231,12 +232,15 @@ class PipelineWorkspaceTests(unittest.TestCase):
             "sampling_total_actual": 2, "sampling_maximum": 4,
             "sampling_target_ess": 1.0, "sampling_tau": np.array([[[0.5]]]),
             "sampling_ess": np.array([[[2.0]]]),
+            "sampling_constant_sector": np.array([[[True, False, True]]]),
+            "sampling_sector_transitions": np.array([[[0, 1, 0]]]),
             "sampling_stop_reason": np.array(["target_ess_per_boundary"]),
         }
 
     def test_common_plaquette_stages_fit_both_definitions(self):
         cfg = load_config(ROOT / "configs" / "example.toml")
         cfg["runtime"]["device"] = "cpu"
+        cfg["diagnostics"]["strict"] = True
         cfg["model"]["alpha"] = 0.2
         cfg["renormalization"]["type"] = ["z", "U"]
         geometry = {"padding": 0, "L_fine": 8, "L_coarse": 2, "factor": 4}
@@ -252,6 +256,10 @@ class PipelineWorkspaceTests(unittest.TestCase):
                 "cpn_renorm.pipeline.generate_one_plaq", return_value=raw), patch(
                 "cpn_renorm.pipeline.isolated_fit", side_effect=fake_fit) as fit:
             one = _run_one_plaq(cfg, Path(folder), geometry)
+            stored = json.loads((Path(folder) / "step1_1plaq/result.json").read_text())
+            self.assertEqual(stored["sampling"]["constant_sector"], [[[True, False, True]]])
+            self.assertEqual(stored["sampling"]["sector_transitions"], [[[0, 1, 0]]])
+            self.assertTrue(one["diagnostics"]["valid"])
             two = _run_two_plaq(cfg, Path(folder), geometry, one)
         self.assertEqual(set(two["fits"]), {"U", "z"})
         self.assertEqual(two["fits"]["U"]["new"]["beta"], 1.0)

@@ -675,6 +675,9 @@ def _run_one_plaq(cfg: dict, run_dir: Path, geometry: dict) -> dict:
                            "ess": np.asarray(raw["sampling_ess"]),
                            "stop_reason": stop_reasons},
               "diagnostics": {"valid": not warnings, "warnings": warnings}}
+    result["sampling"].update(
+        constant_sector=np.asarray(raw["sampling_constant_sector"]),
+        sector_transitions=np.asarray(raw["sampling_sector_transitions"]))
     atomic_json(result_path, result)
     return result
 

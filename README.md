@@ -100,9 +100,17 @@ one-plaquette and topology workloads separately, and writes
 `runs/example/chain_tuning.json`. It prints a TOML snippet but never modifies
 the input configuration. The recommendation is the smallest safe chain count
 within 90% of the best measured throughput; by default a candidate may use at
-most 80% of CUDA memory and an estimated 8 GiB of host measurement memory.
+most 80% of CUDA memory. The host-memory budget is the smaller of 8 GiB and
+half of currently available RAM (including Linux cgroup limits).
+Plaquette estimates use the maximum measurements per boundary and include
+history, diagnostic temporaries, accumulated histograms, warmup probes, and
+CPU sampler workspace when sampling on CPU.
 Adjust those limits with `--gpu-memory-fraction`, `--max-host-memory-gb`, and
 `--max-chains`.
+Before plaquette generation, the same host-memory check is applied to manual,
+tuned, and restored chain counts. An unsafe width raises an error before
+allocating the history; lower the stage width or retune. These are conservative
+estimates with headroom, rather than a reservation against other processes.
 
 All commands for a configuration named `example.toml` share the
 `runs/example/` workspace. Re-running reuses every compatible pilot, completed
@@ -206,6 +214,23 @@ accumulated online, while only compact mode and topology time series are
 retained. The pilot xi_G error is
 obtained by propagating the full multi-chain Gamma-method covariance of its
 three Fourier modes, including both cross-mode and temporal correlations.
+Plaquette observables use one float64 history buffer sized for the maximum
+measurement count. ESS checks transform and process one boundary at a time,
+and the returned history shares the buffer rather than copying it. The full
+configuration history is never retained.
+
+The 1plaq stopping rule checks all three charges (`Q_U`, `Q_z`, `Q_s`). For
+each frozen boundary, ESS is computed from integer charge differences relative
+to the first sample, after validating quantization within a dtype- and
+patch-area-dependent roundoff tolerance. Original charges and fit histograms
+are unchanged. A sector with no observed changes uses the constant-series
+convention `tau=0.5`, nominal `ESS=number of measurements`; this does not prove
+that other sectors have been explored. Per-observable constant counts appear
+in progress summaries. The 1plaq JSON sampling section records
+`constant_sector` and `sector_transitions`, with axes `[batch, chain, Q_U/Q_z/Q_s]`.
+These flags alone do not fail strict diagnostics. The 2plaq rule still checks
+both sine and cosine for both U/z angles; observable and topology criteria are
+unchanged.
 
 The reference example requests 5000 two-plaquette and 2000 one-plaquette
 boundaries. With `chains = 32`, these become 157 batches / 5024 boundaries and

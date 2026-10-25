@@ -44,6 +44,13 @@ def main(destination):
             report['sampling'][stage]={'seconds':time.perf_counter()-t,
                 **{key:np.asarray(raw[key]).tolist() for key in ('accept_rate','sampling_ess','sampling_tau',
                     'sampling_actual','sampling_stop_reason','warmup_stop_reason')}}
+            if stage == 'one_plaq':
+                flags = np.asarray(raw['sampling_constant_sector'])
+                transitions = np.asarray(raw['sampling_sector_transitions'])
+                np.testing.assert_array_equal(flags, transitions == 0)
+                np.testing.assert_array_equal(np.asarray(raw['sampling_tau'])[flags], .5)
+                for key in ('sampling_constant_sector', 'sampling_sector_transitions'):
+                    report['sampling'][stage][key] = np.asarray(raw[key]).tolist()
             for tag in ('U','z'):
                 key='s' if stage=='one_plaq' and tag=='U' else tag
                 X,freq=raw['X_'+key],raw['freq_'+key]

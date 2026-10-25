@@ -16,6 +16,7 @@ from .progress import SimulationProgress
 from .sampler import ActionKind, BatchedHMCSampler, Couplings
 from .storage import atomic_json
 from .workspace import workspace_dir
+from .memory import host_budget_gib, patch_peak_gib, patch_workspace_gib
 
 
 SEARCH_GROWTH_FACTOR = 4
@@ -40,6 +41,8 @@ class Workload:
     ensembles: int = 1
     batched_ensembles: bool = False
     settings_name: str | None = None
+    histogram_bins: int = 128
+    histogram_zero_pad: int = 1
 
 
 def chain_candidates(max_chains: int) -> list[int]:
@@ -122,7 +125,8 @@ def _workloads(cfg: dict, pilot: dict) -> dict[str, list[Workload]]:
                      int(settings["adapt_steps"]) +
                      int(settings["max_meas_per_boundary"]),
                      int(settings["max_meas_per_boundary"]), False, 0,
-                     fit_times, True, stage),
+                     fit_times, True, stage, int(settings.get("bins", 128)),
+                     int(settings.get("zero_pad", 1))),
         ]
 
     observable = section(cfg, "observable")
@@ -182,6 +186,10 @@ def _workloads(cfg: dict, pilot: dict) -> dict[str, list[Workload]]:
 
 
 def _host_gib(workload: Workload, chains: int, dtype: torch.dtype) -> float:
+    if workload.name == "inner_patch" and workload.settings_name in ("one_plaq", "two_plaq"):
+        return patch_peak_gib(workload.settings_name, chains, workload.n_meas,
+                              workload.Ly - 1, workload.ensembles,
+                              workload.histogram_bins, workload.histogram_zero_pad)
     if not workload.stores_correlations:
         return 0.0
     itemsize = 8 if dtype == torch.float64 else 4
@@ -293,14 +301,22 @@ def _benchmark_candidate(cfg: dict, workloads: list[Workload], chains: int,
                  if device.type == "cuda" else None)
     target_sweeps, too_short = _target_sweeps(workloads, chains)
     host_gib = max(_host_gib(x, chains, dtype) for x in workloads)
+    if any(w.name == "inner_patch" for w in workloads):
+        outer = next(w for w in workloads if w.name == "outer_boundary")
+        settings = section(cfg, outer.settings_name)
+        host_gib += patch_workspace_gib(
+            chains, outer.Lx * outer.Ly, int(cfg["model"]["N"]),
+            int(settings["max_warmup"]), device.type == "cpu")
     preflight_reasons = []
-    if host_gib > max_host_memory_gib:
+    host_limit = host_budget_gib(max_host_memory_gib)
+    if host_gib > host_limit:
         preflight_reasons.append("host_measurement_memory_limit")
     if too_short:
         preflight_reasons.append("per_chain_series_too_short")
     if preflight_reasons:
         return {"chains": chains, "safe": False,
                 "reason": ",".join(preflight_reasons),
+                "host_memory_limit_gib": host_limit,
                 "estimated_host_measurement_gib": host_gib,
                 "workloads": []}
 
@@ -342,6 +358,7 @@ def _benchmark_candidate(cfg: dict, workloads: list[Workload], chains: int,
         "projected_batch_seconds": projected_seconds,
         "projected_target_seconds": projected_seconds,
         "peak_gpu_gib": peak_gpu if gpu_total is not None else None,
+        "host_memory_limit_gib": host_limit,
         "estimated_host_measurement_gib": host_gib,
         "safe": True,
         "reason": None,

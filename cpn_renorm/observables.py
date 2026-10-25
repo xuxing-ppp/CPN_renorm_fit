@@ -95,7 +95,12 @@ def rectangular_loops(sampler: BatchedHMCSampler,
 
 def autocorr_time(values: np.ndarray, c: float = 5.0) -> float:
     x = np.asarray(values, dtype=float)
-    if x.size < 4 or not np.isfinite(x).all() or np.var(x) == 0:
+    if x.size < 4 or not np.isfinite(x).all():
+        return 0.5
+    # Remove the common offset before estimating the mean. Otherwise roundoff
+    # in an almost constant charge can masquerade as a non-decaying covariance.
+    x = x - x[0]
+    if np.var(x) == 0:
         return 0.5
     x = x - x.mean()
     n = len(x)

@@ -13,6 +13,7 @@ from .pilot import resolve_device, torch_dtype
 from .observables import _z_link_phase, autocorr_time, automatic_warmup
 from .progress import SimulationProgress
 from .storage import atomic_npz
+from .memory import host_budget_gib, patch_peak_gib, patch_workspace_gib
 
 
 TWO_PLAQ_ALGORITHM_REVISION = 3
@@ -67,54 +68,108 @@ def _warmup(sampler: BatchedHMCSampler, settings: dict, probe=None, *,
 
 def _adaptive_samples(sampler: BatchedHMCSampler, settings: dict, observe,
                       ess_transform=None, *,
-                      progress: SimulationProgress | None = None) -> tuple[np.ndarray, dict]:
+                      progress: SimulationProgress | None = None,
+                      topology_area: int | None = None,
+                      topology_dtype=np.float64) -> tuple[np.ndarray, dict]:
     minimum = int(settings["min_meas_per_boundary"])
     maximum = int(settings["max_meas_per_boundary"])
     target = float(settings["target_ess_per_boundary"])
     block = max(16, min(128, minimum // 4 or 1))
-    samples, reason = [], "max_meas_per_boundary"
+    data = None
+    actual, reason = 0, "max_meas_per_boundary"
     if progress is not None:
         progress.phase("sampling", maximum)
-    while len(samples) < maximum:
-        count = min(block, maximum - len(samples))
-        if len(samples) < minimum:
-            count = min(count, minimum - len(samples))
+    while actual < maximum:
+        count = min(block, maximum - actual)
+        if actual < minimum:
+            count = min(count, minimum - actual)
         for _ in range(count):
             sampler.sweep(s_step=float(settings["s_step"]),
                           s_updates=int(settings["s_updates"]))
-            samples.append(observe(sampler))
+            value = observe(sampler)
+            if data is None:
+                # Allocate once: ESS checks and the return value share this buffer.
+                data = np.empty((maximum, *value.shape), dtype=float)
+            data[actual] = value
+            actual += 1
             if progress is not None:
                 progress.update()
-        if len(samples) >= minimum:
-            primary = np.asarray(samples)
-            stats = _per_boundary_stats(
-                ess_transform(primary) if ess_transform else primary)
+        if actual >= minimum:
+            stats = _per_boundary_stats(data[:actual], ess_transform,
+                                        topology_area=topology_area,
+                                        topology_dtype=topology_dtype)
             if progress is not None:
-                progress.update(0, samples=len(samples),
-                                ess=f"{float(np.min(stats['ess'])):.1f}/{target:g}")
+                extra = ({"constant_sectors": _constant_sector_counts(
+                    stats["constant_sector"])} if topology_area is not None else {})
+                progress.update(0, samples=actual,
+                                ess=f"{float(np.min(stats['ess'])):.1f}/{target:g}", **extra)
             if np.all(stats["ess"] >= target):
                 reason = "target_ess_per_boundary"
                 break
-    data = np.asarray(samples)
-    stats = _per_boundary_stats(ess_transform(data) if ess_transform else data)
-    return data, {"minimum": minimum, "actual": len(data), "maximum": maximum,
-                  "per_chain": len(data), "target_ess": target,
-                  "tau": stats["tau"], "ess": stats["ess"],
+    return data[:actual], {"minimum": minimum, "actual": actual, "maximum": maximum,
+                  "per_chain": actual, "target_ess": target,
+                  **stats,
                   "stop_reason": reason}
 
 
-def _per_boundary_stats(values: np.ndarray) -> dict[str, np.ndarray]:
+def _constant_sector_counts(flags: np.ndarray) -> str:
+    return ",".join(f"{tag}:{int(count)}" for tag, count in
+                    zip(("Q_U", "Q_z", "Q_s"), np.sum(flags, axis=0)))
+
+
+def _topology_sectors(values: np.ndarray, *, area: int, dtype, chain: int) -> np.ndarray:
+    """Integer charge differences for one frozen boundary: [sweeps, 1, obs]."""
+    names = ("Q_U", "Q_z", "Q_s")
+    if not np.isfinite(values).all():
+        col = int(np.argwhere(~np.isfinite(values))[0, -1])
+        raise ValueError(f"topology chain={chain} observable={names[col]}: non-finite charge")
+    delta = values - values[0]
+    sectors = np.rint(delta)
+    residual = np.max(np.abs(delta - sectors), axis=(0, 1))
+    scale = np.maximum(max(1, area), np.max(np.abs(values), axis=(0, 1)))
+    tolerance = 64 * np.finfo(dtype).eps * scale
+    invalid = np.flatnonzero(residual > tolerance)
+    if invalid.size:
+        col = int(invalid[0])
+        raise ValueError(
+            f"topology chain={chain} observable={names[col]}: "
+            f"noninteger sector difference residual={residual[col]:.6g} "
+            f"exceeds tolerance={tolerance[col]:.6g}")
+    return sectors
+
+
+def _per_boundary_stats(values: np.ndarray, transform=None, *,
+                        topology_area: int | None = None,
+                        topology_dtype=np.float64) -> dict[str, np.ndarray]:
     """Return autocorrelation diagnostics without pooling frozen boundaries."""
     x = np.asarray(values, dtype=float)
     if x.ndim == 2:
         x = x[..., None]
     if x.ndim != 3:
         raise ValueError("patch samples must have shape [sweeps, chains, observables]")
-    tau = np.empty((x.shape[1], x.shape[2]), dtype=float)
+    if topology_area is not None and transform is not None:
+        raise ValueError("topology sector statistics cannot also transform angles")
+    sector_transitions = (np.empty((x.shape[1], x.shape[2]), dtype=np.int64)
+                          if topology_area is not None else None)
+    tau = None
     for chain in range(x.shape[1]):
-        for observable in range(x.shape[2]):
-            tau[chain, observable] = autocorr_time(x[:, chain, observable])
-    return {"tau": tau, "ess": x.shape[0] / (2 * np.maximum(tau, 0.5))}
+        # Keep the chain axis for transforms expecting [sweeps, chains, obs].
+        series = x[:, chain:chain + 1]
+        if topology_area is not None:
+            series = _topology_sectors(series, area=topology_area,
+                                        dtype=topology_dtype, chain=chain)
+            sector_transitions[chain] = np.count_nonzero(np.diff(series, axis=0), axis=(0, 1))
+        if transform is not None:
+            series = transform(series)
+        if tau is None:
+            tau = np.empty((x.shape[1], series.shape[2]), dtype=float)
+        for observable in range(series.shape[2]):
+            tau[chain, observable] = autocorr_time(series[:, 0, observable])
+    result = {"tau": tau, "ess": x.shape[0] / (2 * np.maximum(tau, 0.5))}
+    if sector_transitions is not None:
+        result.update(sector_transitions=sector_transitions,
+                      constant_sector=sector_transitions == 0)
+    return result
 
 
 def patch_batch_count(fit_times: int, chains: int) -> int:
@@ -373,14 +428,15 @@ def _generate_one_plaq_batch_impl(cfg: dict, geometry: dict, batch_index: int,
     def observe(item):
         qu, qz, qs = _obc_topology(sampler)
         return torch.stack((qu, qz, qs), -1).cpu().numpy()
-    q, sampling = _adaptive_samples(sampler, settings, observe, progress=progress)
+    q, sampling = _adaptive_samples(
+        sampler, settings, observe, progress=progress, topology_area=L * L,
+        topology_dtype=np.float32 if sampler.dtype == torch.float32 else np.float64)
     offsets = np.stack((da_u, da_z, da_u), -1) / (2 * np.pi)
-    vortex = q - offsets[None]
     out: dict[str, np.ndarray | float] = {}
     for col, tag, da in ((0, "U", da_u), (1, "z", da_z), (2, "s", da_u)):
         xs, fs = [], []
         for chain in range(sampler.chains):
-            values = vortex[:, chain, col]
+            values = q[:, chain, col] - offsets[chain, col]
             zp = int(settings["zero_pad"])
             edges = np.arange(np.floor(values.min()) - 0.5 - zp,
                               np.ceil(values.max()) + 0.6 + zp, 1.0)
@@ -403,6 +459,8 @@ def _generate_one_plaq_batch_impl(cfg: dict, geometry: dict, batch_index: int,
     out["inner_adapt_steps"] = warmup["adapt_steps"]
     out["sampling_tau"] = sampling["tau"]
     out["sampling_ess"] = sampling["ess"]
+    out["sampling_constant_sector"] = sampling["constant_sector"]
+    out["sampling_sector_transitions"] = sampling["sector_transitions"]
     out["sampling_minimum"] = sampling["minimum"]
     out["sampling_actual"] = sampling["actual"]
     out["sampling_maximum"] = sampling["maximum"]
@@ -464,6 +522,9 @@ def _batch_summary(stage: str, batch_index: int, result: dict) -> str | None:
         return None
     ess_min = float(np.min(np.asarray(result["sampling_ess"], dtype=float)))
     accept = float(np.mean(np.asarray(result["accept_rate"], dtype=float)))
+    constant = (" constant_sectors=" + _constant_sector_counts(
+        np.asarray(result["sampling_constant_sector"]))
+        if "sampling_constant_sector" in result else "")
     return (f"finished {stage} batch {batch_index + 1}: "
             f"warmup=outer:{int(result['outer_warmup_sweeps'])}"
             f"({result['outer_warmup_stop_reason']})/"
@@ -471,7 +532,7 @@ def _batch_summary(stage: str, batch_index: int, result: dict) -> str | None:
             f"samples={int(result['sampling_actual'])}/boundary "
             f"ess={ess_min:.1f}/{float(result['sampling_target_ess']):g} "
             f"stop={result['sampling_stop_reason']} accept={accept:.3f} "
-            f"epsilon={float(result['epsilon']):.4g}")
+            f"epsilon={float(result['epsilon']):.4g}{constant}")
 
 
 def _load_or_generate_batch(cfg: dict, geometry: dict, *, stage: str,
@@ -520,6 +581,9 @@ def _aggregate_batches(batches: list[dict], settings: dict,
         out[key] = np.asarray([np.asarray(batch[key]).item() for batch in batches])
     for key in ("outer_warmup_tau", "warmup_tau", "sampling_tau", "sampling_ess"):
         out[key] = np.stack([np.asarray(batch[key]) for batch in batches])
+    for key in ("sampling_constant_sector", "sampling_sector_transitions"):
+        if key in batches[0]:
+            out[key] = np.stack([np.asarray(batch[key]) for batch in batches])
     chains = int(settings["chains"])
     requested = int(settings["fit_times"])
     out.update({
@@ -536,8 +600,34 @@ def _aggregate_batches(batches: list[dict], settings: dict,
     return out
 
 
+def _check_patch_memory(cfg: dict, geometry: dict, stage: str) -> None:
+    """Check manual, tuned, and restored widths before allocating histories."""
+    settings = section(cfg, stage)
+    chains = int(settings["chains"])
+    factor, pad = int(cfg["renormalization"]["factor"]), int(geometry["padding"])
+    add = int(cfg["geometry"]["boundary_bc"] != "PBC")
+    width = factor * (2 if stage == "two_plaq" else 1)
+    sites = (width + 2 * pad + add) * (factor + 2 * pad + add)
+    estimate = patch_peak_gib(stage, chains, int(settings["max_meas_per_boundary"]),
+                              factor, int(settings["fit_times"]),
+                              int(settings.get("bins", 128)),
+                              int(settings.get("zero_pad", 1)))
+    estimate += patch_workspace_gib(
+        chains, sites, int(cfg["model"]["N"]), int(settings["max_warmup"]),
+        resolve_device(cfg["runtime"]["device"]).type == "cpu")
+    budget = host_budget_gib(float(cfg.get("_tuning_limits", {}).get(
+        "max_host_memory_gib", 8.0)))
+    if estimate > budget:
+        raise MemoryError(
+            f"{stage}: chains={chains} needs an estimated {estimate:.3f} GiB "
+            f"host memory at maximum measurements; budget={budget:.3f} GiB. "
+            "Lower the stage's chains or retune with a smaller host-memory budget; "
+            "restored chain counts are subject to the same check.")
+
+
 def generate_two_plaq(cfg: dict, geometry: dict,
                       cache_dir: str | Path | None = None) -> dict:
+    _check_patch_memory(cfg, geometry, "two_plaq")
     settings = section(cfg, "two_plaq")
     count = patch_batch_count(int(settings["fit_times"]), int(settings["chains"]))
     print(f"[cpn-renorm] two_plaq boundaries: requested={settings['fit_times']} "
@@ -551,6 +641,7 @@ def generate_two_plaq(cfg: dict, geometry: dict,
 
 def generate_one_plaq(cfg: dict, geometry: dict,
                       cache_dir: str | Path | None = None) -> dict:
+    _check_patch_memory(cfg, geometry, "one_plaq")
     settings = section(cfg, "one_plaq")
     count = patch_batch_count(int(settings["fit_times"]), int(settings["chains"]))
     print(f"[cpn-renorm] one_plaq boundaries: requested={settings['fit_times']} "
