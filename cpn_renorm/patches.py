@@ -128,6 +128,10 @@ def _topology_sectors(values: np.ndarray, *, area: int, dtype, chain: int) -> np
     residual = np.max(np.abs(delta - sectors), axis=(0, 1))
     scale = np.maximum(max(1, area), np.max(np.abs(values), axis=(0, 1)))
     tolerance = 64 * np.finfo(dtype).eps * scale
+    # Berry-link phases and their sums can accumulate more float64 roundoff
+    # than the area estimate covers, especially for small patches.
+    if np.dtype(dtype) == np.dtype(np.float64):
+        tolerance = np.maximum(tolerance, 1e-10)
     invalid = np.flatnonzero(residual > tolerance)
     if invalid.size:
         col = int(invalid[0])

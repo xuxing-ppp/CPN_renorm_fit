@@ -5,7 +5,7 @@ import sys
 
 # Source run name (searched under runs/), or a run directory path.
 # Relative directory paths are relative to the project root.
-SOURCE = "runs/N2_L2/N2_L2_b1.0"
+SOURCE = "runs/N2_L2/N2_L2_b1.2"
 MOD = 0
 TYPE = "z"                 # Source branch type, U or z.
 BETA_METHOD = "magsus"       # magsus or corrG; also selects the next fit method.

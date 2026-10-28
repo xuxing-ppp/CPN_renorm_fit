@@ -53,8 +53,9 @@ class SectorEssTests(unittest.TestCase):
 
     def test_quantization_tolerance_uses_area_dtype_and_charge_scale(self):
         epsilon = np.finfo(np.float64).eps
-        for area, charge in ((4, 0.), (16, 0.), (4, 100.)):
-            tolerance = 64 * epsilon * max(1, area, abs(charge))
+        for area, charge in ((4, 0.), (16, 0.), (4, 100.),
+                             (16384, 0.), (4, 16384.)):
+            tolerance = max(1e-10, 64 * epsilon * max(1, area, abs(charge)))
             values = np.full((16, 1, 3), charge)
             values[1, 0, 1] += .5 * tolerance
             self.assertTrue(_per_boundary_stats(values, topology_area=area)
@@ -68,12 +69,27 @@ class SectorEssTests(unittest.TestCase):
             _per_boundary_stats(values, topology_area=4)
         for dtype in (np.float32, np.float64):
             values = np.zeros((16, 1, 3))
-            values[1, 0, 0] = 128 * np.finfo(dtype).eps * 4
+            tolerance = 64 * np.finfo(dtype).eps * 4
+            if dtype == np.float64:
+                tolerance = max(tolerance, 1e-10)
+            values[1, 0, 0] = 2 * tolerance
             with self.assertRaisesRegex(ValueError, "observable=Q_U"):
                 _per_boundary_stats(values, topology_area=4, topology_dtype=dtype)
         values[1, 0, 0] = np.nan
         with self.assertRaisesRegex(ValueError, "non-finite"):
             _per_boundary_stats(values, topology_area=4)
+
+    def test_float64_sector_roundoff_floor_preserves_integer_jumps(self):
+        values = np.zeros((32, 1, 3))
+        values[1:, 0, 1] = 6.17284e-14
+        stats = _per_boundary_stats(values, topology_area=4)
+        self.assertTrue(stats["constant_sector"].all())
+        np.testing.assert_array_equal(stats["ess"], 32.)
+
+        values[16:, 0, 1] += 1.
+        stats = _per_boundary_stats(values, topology_area=4)
+        self.assertEqual(stats["sector_transitions"][0, 1], 1)
+        self.assertFalse(stats["constant_sector"][0, 1])
 
     @staticmethod
     def sample(history, minimum, target):

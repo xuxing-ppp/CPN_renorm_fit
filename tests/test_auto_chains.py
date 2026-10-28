@@ -201,7 +201,8 @@ class AutoChainsTests(unittest.TestCase):
         self.assertNotIn("chains", report)
         self.assertFalse(any("topo" in key for key in report["stages"]))
 
-    def test_type_mod_product_reuse_precision_and_errors(self):
+    @patch("cpn_renorm.pipeline.isolated_plaq_plot")
+    def test_type_mod_product_reuse_precision_and_errors(self, _plot):
         for beta1, expected_common_calls in ((0.0, 1), (0.1, 2)):
             with self.subTest(beta1=beta1):
                 cfg = self.config()

@@ -257,6 +257,12 @@ The top-level `summary.json` contains the input physical parameters, requested
 methods, actual geometry and final branch estimates. Each branch lists complete
 method combinations under `results`: `couplings` groups `beta`, `beta1`, `alpha`,
 independent `alpha1`; `errors` groups the directly fitted uncertainties.
+Top-level `diagnostics` collects warnings from the pilot, plaquette fits, and
+selected observable/topology scans, including measurement limits, warmup limits,
+acceptance checks, failed fits and unbracketed targets. It contains `valid`,
+`warning_count`, and a deduplicated `warnings` list with `source` (relative JSON
+path), `location` (field within that file), and `message`. Exploratory measurement
+warnings remain available even after their ensemble files are cleaned up.
 Beta/alpha1 errors are conditional on the fixed alpha from the corresponding
 1plaq or topo stage. Alpha errors belong
 to their own 1plaq or topo stage; there is no whole-pipeline bootstrap.
@@ -270,9 +276,12 @@ MSE diagnostics and full refit records. Next-step configurations are generated f
 not duplicate it. `resolved.json` owns the effective configuration, actual chain
 widths and shared simulation contexts. `run_state.json` owns command/status and
 configuration identity. Each ensemble JSON owns its scalar measurements;
-stage JSON files reference those ensembles and keep fit/search diagnostics,
-including cached methods that are no longer selected. Only selected methods
-appear in the final summary.
+stage JSON files reference those ensembles and keep fit/search diagnostics.
+After a branch completes, its ensemble directory retains only the current fine
+references, coarse scan points and final fit points for selected methods.
+All other ensemble directories, including points left by earlier runs, are
+removed. Disabled scans and deselected methods no longer retain cached results.
+Cleanup waits until observable/topology matching and topo refits complete.
 
 ### Generate the next renormalization configuration
 
@@ -417,6 +426,19 @@ migration utility only serializes historical results and cannot make folded
 histograms compatible with the new full-action pipeline. New action/fitting/scan
 identities prevent old folded 2plaq and obs/topo reuse; compatible pilot and raw
 1plaq data may be reused. Missing raw data are resampled.
+
+Fresh fits also produce PNG diagnostics, including with `save_npz=false`:
+`step1_1plaq/one_plaq_fit.png` overlays all histogram points and the continuous
+Villain fit against `f = vortex + da/(2*pi)`, with a panel per fitted U/z type.
+`step2_2plaq/two_plaq_fit_{type}.png` shows nine randomly selected boundary
+histograms in a 3x3 grid, each overlaid with full (new) and folded (old) fits.
+Selection is reproducible from the runtime seed; fewer than nine boundaries
+are all shown. Each topo refit produces `step4_topo/two_plaq_refit_{method}.png`
+using the same boundary selection as its initial fit. Observable
+`beta1_scan_{method}.png` and topo `alpha_scan_{method}.png` show the complete
+scan beside a zoom of the final fit points, with measurement errors, local fit,
+reference error band and annotated intersection. These plots do not change
+fitting or sampling, and completed cached plaquette/topo fits are not backfilled.
 
 No bin counts were changed for this pipeline. Fits still target bin centers,
 without bin integration or an automatic second bin-resolution stage. Run the

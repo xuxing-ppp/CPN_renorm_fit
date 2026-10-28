@@ -100,13 +100,13 @@ refine_tolerance = 0.02
 max_refine_rounds = 10
 # Build an odd, uniform final grid from the preliminary bootstrap coupling error.
 fit_points = 5
-fit_sigma_multiplier = 3.0
+fit_sigma_multiplier = 5.0
 # Widen spacing after insufficient separation, capped by fit_spacing_max.
 fit_spacing_growth_factor = 2.0
 fit_spacing_min = 0.01
-fit_spacing_max = 0.1
+fit_spacing_max = 0.5
 fit_confidence_sigma = 2.0
-max_fit_grid_rounds = 3
+max_fit_grid_rounds = 5
 
 [scan.alpha]
 min = 0.01
@@ -117,13 +117,13 @@ max_rounds = 7
 refine_tolerance = 0.002
 max_refine_rounds = 10
 fit_points = 5
-fit_sigma_multiplier = 3.0
+fit_sigma_multiplier = 5.0
 # Widen spacing after insufficient separation, capped by fit_spacing_max.
 fit_spacing_growth_factor = 2.0
 fit_spacing_min = 0.001
-fit_spacing_max = 0.01
+fit_spacing_max = 0.05
 fit_confidence_sigma = 2.0
-max_fit_grid_rounds = 3
+max_fit_grid_rounds = 5
 
 [steps.two_plaq]
 # chains is GPU batch width, not the number of fitted boundaries. fit_times is

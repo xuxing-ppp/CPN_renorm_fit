@@ -11,7 +11,9 @@ import numpy as np
 from .cache import (load_point, point_identity, read_json,
                     scan_measurements, store_point, write_scan_points)
 from .config import fingerprint, mod_config, section
-from .fit_client import extend_scan, isolated_fit, isolated_match, isolated_plot
+from .diagnostics import collect_diagnostics, measurement_warnings
+from .fit_client import (extend_scan, isolated_fit, isolated_match,
+                         isolated_plaq_plot, isolated_plot)
 from .methods import BETA1_METHODS
 from .observables import measure_ensemble
 from .patches import (generate_one_plaq, generate_two_plaq,
@@ -179,6 +181,39 @@ def _remove_scan_ensembles(run_dir: Path, folders: list[str]) -> list[str]:
             shutil.rmtree(folder)
             removed.append(folder.name)
     return removed
+
+
+def _prune_scan_ensembles(run_dir: Path, *stages: dict) -> list[str]:
+    """Retain only ensembles referenced by the current completed scans."""
+    ensembles = (run_dir / "ensembles").resolve()
+    keep = set()
+
+    def retain(raw: str) -> None:
+        path = (run_dir / raw).resolve()
+        if path.parent.parent != ensembles or path.name != "result.json":
+            raise RuntimeError(f"refusing ensemble reference outside {ensembles}: {path}")
+        if not path.is_file():
+            raise RuntimeError(f"refusing cleanup with missing ensemble reference: {path}")
+        keep.add(path.parent)
+
+    def references(stage: dict) -> None:
+        if stage.get("fine_path"):
+            retain(stage["fine_path"])
+        for entry in stage.get("measurements", {}).values():
+            retain(entry["path"])
+        for match in stage.get("matches", {}).values():
+            references(match)
+
+    for stage in stages:
+        references(stage)
+    # Validate every candidate before deleting anything, including symlink targets.
+    discard = []
+    for folder in sorted(ensembles.iterdir()) if ensembles.is_dir() else []:
+        if folder.is_symlink():
+            raise RuntimeError(f"refusing symlink in ensemble directory: {folder}")
+        if folder.is_dir() and folder.resolve() not in keep:
+            discard.append(str(folder))
+    return _remove_scan_ensembles(run_dir, discard)
 
 
 def _censored_xi_G_bracket(xs: np.ndarray, ys: np.ndarray,
@@ -375,6 +410,14 @@ def _two_raw_key(cfg: dict, geometry: dict) -> str:
     return patch_result_key(cfg, geometry, "two_plaq")
 
 
+def _plot_two_fit(cfg: dict, destination: Path, raw: dict, tag: str, fit: dict) -> None:
+    isolated_plaq_plot(destination, operation="plot_two", request={
+        "N": int(cfg["model"]["N"]), "tag": tag, "fit": fit,
+        "bins": int(cfg["steps"]["two_plaq"]["bins"]),
+        "seed": int(cfg["runtime"]["seed"]) + 92001},
+        X=raw[f"X_{tag}"], freq=raw[f"freq_{tag}"])
+
+
 def _run_two_plaq(cfg: dict, run_dir: Path, geometry: dict, one_plaq: dict) -> dict:
     result_path = run_dir / "step2_2plaq" / "result.json"
     result_key = _two_fit_key(cfg, geometry, one_plaq)
@@ -396,6 +439,8 @@ def _run_two_plaq(cfg: dict, run_dir: Path, geometry: dict, one_plaq: dict) -> d
             X=raw[f"X_{tag}"], freq=raw[f"freq_{tag}"])
         fits[tag]["new"].update(alpha_source=fixed.get("source", "1plaq"),
                                   fixed_alpha_error=fixed.get("alpha_err"))
+        _plot_two_fit(cfg, run_dir / "step2_2plaq" / f"two_plaq_fit_{tag}.png",
+                      raw, tag, fits[tag])
     atomic_json(run_dir / "step2_2plaq" / "fit.log", fits)
     raw["two_plaq_raw_key"] = np.asarray(_two_raw_key(cfg, geometry))
     cfg["_two_raw"] = raw
@@ -461,6 +506,8 @@ def _plot_beta1_scan(run_dir: Path, scale_factor: int, fine: dict,
             errors={label: np.array([float(measured[x][field + "_err"]) * scale
                 if measured[x].get(field + "_err") is not None else np.nan for x in xs])},
             matches={label: matches[method]}, targets={f"fine_{field}": fine[field]},
+            target_errors=({f"fine_{field}": fine[field + "_err"]}
+                           if fine.get(field + "_err") is not None else {}),
             xlabel="beta1", ylabel=field)
     old_plot = run_dir / "step3_observable" / "beta1_scan.png"
     if old_plot.exists():
@@ -562,8 +609,10 @@ def _run_beta1_scan(cfg: dict, run_dir: Path, geometry: dict,
         beta_c=beta_c, alpha1_c=alpha1_c, alpha_c=alpha_c)
     if not compatible:
         measured, phases = {}, {}
-    matches = dict(cached.get("matches", {})) if compatible else {}
-    fingerprints = dict(cached.get("method_fingerprints", {})) if compatible else {}
+    matches = {name: match for name, match in cached.get("matches", {}).items()
+               if name in methods} if compatible else {}
+    fingerprints = {name: key for name, key in cached.get("method_fingerprints", {}).items()
+                    if name in methods} if compatible else {}
     fine_path = run_dir / cached.get("fine_path", "missing")
     fine = load_point(fine_path.parent) if compatible and fine_path.is_file() else _measure_point(
         cfg, run_dir, settings, tag="obs_fine", L=geometry["L_fine"],
@@ -592,12 +641,20 @@ def _run_beta1_scan(cfg: dict, run_dir: Path, geometry: dict,
             seed=descriptor["seed"], censored_xi_G=field == "xi_G")
         fingerprints[name] = _method_key(cfg, geometry, method=name, kind="beta1",
             renorm_type=renorm_type, beta_c=beta_c, alpha1_c=alpha1_c, alpha_c=alpha_c)
+    # Cached final labels can belong to methods that are no longer selected.
+    final_points = {float(x) for match in matches.values() for x in match.get("fit_points", [])}
+    for value, labels in phases.items():
+        labels.discard("final")
+        if _same_point(value, final_points):
+            labels.add("final")
     entries, cleanup = _retain_scan(run_dir, measured, phases, tag="obs_coarse")
     fine_entries = write_scan_points(run_dir, {0.0: fine}, {0.0: {"reference"}}, tag="obs_fine")
     result = {"step": "observable_beta1", "measurement_key": _scan_fingerprint(
         "beta1", cfg, geometry, renorm_type=renorm_type, beta_c=beta_c,
         alpha1_c=alpha1_c, alpha_c=alpha_c), "fine_path": fine_entries["0.0"]["path"],
-        "measurements": entries, "matches": matches, "method_fingerprints": fingerprints}
+        "measurements": entries, "matches": matches, "method_fingerprints": fingerprints,
+        "measurement_warnings": measurement_warnings(
+            run_dir, measured, cached.get("measurement_warnings", []) if compatible else [])}
     atomic_json(path, result)
     selected = {name: matches[name] for name in methods}
     _plot_beta1_scan(run_dir, R, fine, measured, selected)
@@ -630,6 +687,15 @@ def _run_one_plaq(cfg: dict, run_dir: Path, geometry: dict) -> dict:
                 "device": str(resolve_device(cfg["runtime"]["device"]))},
                 X=raw["X_s" if tag == "U" else "X_z"], freq=raw["freq_s" if tag == "U" else "freq_z"])
             fits[tag]["source"] = "1plaq"
+    plot_tags = [tag for tag in _renorm_types(cfg) if fits[tag].get("source") == "1plaq"]
+    if plot_tags:
+        arrays = {}
+        for tag in plot_tags:
+            source = "s" if tag == "U" else "z"
+            arrays[f"X_{tag}"] = raw[f"X_{source}"]
+            arrays[f"freq_{tag}"] = raw[f"freq_{source}"]
+        isolated_plaq_plot(run_dir / "step1_1plaq" / "one_plaq_fit.png",
+            operation="plot_one", request={"tags": plot_tags, "fits": fits}, **arrays)
     atomic_json(run_dir / "step1_1plaq" / "fit.log", fits)
     if cfg["storage"]["save_npz"]:
         atomic_npz(run_dir / "step1_1plaq" / "measurements.npz", **raw)
@@ -717,8 +783,9 @@ def _run_topo(cfg: dict, run_dir: Path, geometry: dict, beta_c: float,
         cfg, run_dir, settings, **fine_parameters)
     target = float(fine["topology"][component]["topo_sus"]) * R ** 2
     target_err = float(fine["topology"][component]["err"]) * R ** 2
-    matches = dict(cached.get("matches", {}))
-    fingerprints = dict(cached.get("method_fingerprints", {}))
+    matches = {name: match for name, match in cached.get("matches", {}).items() if name in methods}
+    fingerprints = {name: key for name, key in cached.get("method_fingerprints", {}).items()
+                    if name in methods}
     cleanup = []
     for name in methods:
         beta_match = beta1_matches[name]
@@ -752,6 +819,8 @@ def _run_topo(cfg: dict, run_dir: Path, geometry: dict, beta_c: float,
         entries, unused = _retain_scan(run_dir, measured, phases, tag=f"topo_coarse_{name}")
         cleanup.extend(unused)
         match.update(beta1_c=beta1_c, measurements=entries,
+                     measurement_warnings=measurement_warnings(
+                         run_dir, measured, previous.get("measurement_warnings", [])),
                      alpha_before=alpha_1plaq,
                      alpha_after=match.get("value") if match.get("bracketed") else alpha_1plaq,
                      alpha_correction=(float(match["value"])-alpha_1plaq) if match.get("bracketed") else 0.0,
@@ -765,6 +834,7 @@ def _run_topo(cfg: dict, run_dir: Path, geometry: dict, beta_c: float,
             series={"topo_sus_Qs": np.array([observable(measured[x])[0] for x in xs])},
             errors={"topo_sus_Qs": np.array([observable(measured[x])[1] for x in xs])},
             matches={"topo_sus_Qs": match}, targets={f"fine_{component}_scaled": target},
+            target_errors={f"fine_{component}_scaled": target_err},
             xlabel="alpha", ylabel="topological susceptibility")
     fine_entries = write_scan_points(run_dir, {0.0: fine}, {0.0: {"reference"}}, tag="topo_fine")
     fine_key = fingerprint({"parameters": fine_parameters, "settings": section(cfg, "topo"),
@@ -783,8 +853,7 @@ def _run_topo(cfg: dict, run_dir: Path, geometry: dict, beta_c: float,
 
 def _save_topo(run_dir: Path, topo: dict) -> None:
     path = run_dir / "step4_topo" / "result.json"
-    stored = read_json(path) if path.exists() else {}
-    matches = {**stored.get("matches", {}), **topo["matches"]}
+    matches = topo["matches"]
     atomic_json(path, {**{key: value for key, value in topo.items()
                          if not key.startswith("_")}, "matches": matches})
 
@@ -857,6 +926,8 @@ def _finish_topo(cfg: dict, run_dir: Path, common_dir: Path, geometry: dict,
                          "correction": {"alpha": final["alpha"] - alpha_1,
                                         "beta": final["beta"] - fit2["beta"],
                                         "alpha1": final["alpha1"] - fit2["alpha1"]}})
+        _plot_two_fit(cfg, run_dir / "step4_topo" / f"two_plaq_refit_{method}.png",
+                      raw, renorm_type, fitted)
         # Persist each successful method before starting the next fit.
         _save_topo(run_dir, topo)
 
@@ -976,8 +1047,12 @@ def _run_mod_pipeline(cfg: dict, output_root: str | Path) -> dict:
         branches[branch_name]["two_plaq_comparison"] = {
             "old_alpha_eff": old_alpha_eff, "new_alpha_plus_alpha1": alpha_sum,
             "difference": None if old_alpha_eff is None else alpha_sum - old_alpha_eff}
-        cleanup = list(step2.get("_cleanup_folders", [])) + list(topo.get("_cleanup_folders", []))
-        _remove_scan_ensembles(branch_dir, cleanup)
+        # Invalidate disabled stage caches before dropping their old ensembles.
+        for stage_name, stage in (("step3_observable", step2), ("step4_topo", topo)):
+            path = branch_dir / stage_name / "result.json"
+            if not stage.get("matches") and path.exists():
+                atomic_json(path, {"matches": {}})
+        _prune_scan_ensembles(branch_dir, step2, topo)
         chains[branch_name] = dict(cfg["chains"])
     return {"geometry": geometry, "pilot": pilot, "branches": branches, "chains": chains}
 
@@ -1001,6 +1076,7 @@ def run_pipeline(cfg: dict, output_root: str | Path) -> dict:
         geometries = {name: item["geometry"] for name, item in results.items()}
         summary = {"model": cfg["model"], "renormalization": cfg["renormalization"],
                    "geometries": geometries, "branches": branches}
+        summary["diagnostics"] = collect_diagnostics(run_dir, summary, cfg)
         resolved_path = run_dir / "resolved.json"
         resolved = read_json(resolved_path) if resolved_path.exists() else {}
         resolved.update(config={k: v for k, v in cfg.items() if not k.startswith("_")},

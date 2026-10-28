@@ -59,7 +59,8 @@ def isolated_plot(destination: str | Path, *, x: np.ndarray,
                   xlabel: str, ylabel: str,
                   errors: dict[str, np.ndarray] | None = None,
                   matches: dict[str, dict] | None = None,
-                  colors: dict[str, str] | None = None) -> None:
+                  colors: dict[str, str] | None = None,
+                  target_errors: dict[str, float] | None = None) -> None:
     arrays = {"x": np.asarray(x), **series}
     error_keys = {}
     for key, value in (errors or {}).items():
@@ -69,8 +70,15 @@ def isolated_plot(destination: str | Path, *, x: np.ndarray,
     isolated_fit("plot", {"destination": str(Path(destination).resolve()),
                  "series": list(series), "targets": targets,
                  "errors": error_keys, "matches": matches or {},
+                 "target_errors": target_errors or {},
                  "colors": colors or {}, "xlabel": xlabel, "ylabel": ylabel},
                  **arrays)
+
+
+def isolated_plaq_plot(destination: str | Path, *, operation: str,
+                       request: dict, **arrays: np.ndarray) -> dict:
+    return isolated_fit(operation, {
+        **request, "destination": str(Path(destination).resolve())}, **arrays)
 
 
 def extend_scan(points: list[float], result: dict, limits: tuple[float, float],

@@ -32,6 +32,9 @@ def raw_placeholder():
 
 class TopoRefitTests(unittest.TestCase):
     def setUp(self):
+        plotting = patch("cpn_renorm.pipeline.isolated_plaq_plot")
+        self.plot_mock = plotting.start()
+        self.addCleanup(plotting.stop)
         self.cfg = load_config(ROOT / "configs" / "example.toml")
         self.cfg["runtime"]["device"] = "cpu"
         self.cfg["model"].update(mod=[0, 1], alpha=.1)
@@ -70,6 +73,8 @@ class TopoRefitTests(unittest.TestCase):
             self.assertEqual(fit.call_count, 4)
             self.assertEqual([c.args[1]["alpha"] for c in fit.call_args_list
                               if c.args[0] == "two_fixed"], [.2, .4])
+            self.assertEqual([c.args[0].name for c in self.plot_mock.call_args_list],
+                             ["two_plaq_refit_magsus.png", "two_plaq_refit_corrG.png"])
             stored = read_json(Path(folder) / "branch/step4_topo/result.json")
             self.common["raw"] = None
             fit.reset_mock()
@@ -158,6 +163,10 @@ class TopoRefitTests(unittest.TestCase):
                 self.common.update(two_plaq=two, raw=self.cfg.pop("_two_raw"))
                 self.finish(folder)
                 generate.assert_called_once()
+            self.assertEqual(len(self.plot_mock.call_args_list), 4)
+            plot_calls = self.plot_mock.call_args_list
+            self.assertEqual({call.kwargs["request"]["seed"] for call in plot_calls},
+                             {int(self.cfg["runtime"]["seed"]) + 92001})
             self.assertIs(self.common["raw"], raw)
             with np.load(path) as stored:
                 self.assertEqual(str(stored["marker"]), "existing")
@@ -212,6 +221,11 @@ class TopoRefitTests(unittest.TestCase):
 
 
 class PipelineWorkspaceTests(unittest.TestCase):
+    def setUp(self):
+        plotting = patch("cpn_renorm.pipeline.isolated_plaq_plot")
+        self.plot_mock = plotting.start()
+        self.addCleanup(plotting.stop)
+
     @staticmethod
     def _patch_raw() -> dict:
         return {
@@ -241,6 +255,7 @@ class PipelineWorkspaceTests(unittest.TestCase):
         cfg = load_config(ROOT / "configs" / "example.toml")
         cfg["runtime"]["device"] = "cpu"
         cfg["diagnostics"]["strict"] = True
+        cfg["storage"]["save_npz"] = False
         cfg["model"]["alpha"] = 0.2
         cfg["renormalization"]["type"] = ["z", "U"]
         geometry = {"padding": 0, "L_fine": 8, "L_coarse": 2, "factor": 4}
@@ -261,6 +276,12 @@ class PipelineWorkspaceTests(unittest.TestCase):
             self.assertEqual(stored["sampling"]["sector_transitions"], [[[0, 1, 0]]])
             self.assertTrue(one["diagnostics"]["valid"])
             two = _run_two_plaq(cfg, Path(folder), geometry, one)
+            self.assertFalse((Path(folder) / "step1_1plaq/measurements.npz").exists())
+            self.assertFalse((Path(folder) / "step2_2plaq/measurements.npz").exists())
+        self.assertEqual([call.args[0].name for call in self.plot_mock.call_args_list],
+                         ["one_plaq_fit.png", "two_plaq_fit_z.png", "two_plaq_fit_U.png"])
+        one_plot = self.plot_mock.call_args_list[0].kwargs
+        np.testing.assert_array_equal(one_plot["X_U"], raw["X_s"])
         self.assertEqual(set(two["fits"]), {"U", "z"})
         self.assertEqual(two["fits"]["U"]["new"]["beta"], 1.0)
         self.assertEqual(two["fits"]["z"]["new"]["beta"], 2.0)
@@ -390,7 +411,7 @@ class PipelineWorkspaceTests(unittest.TestCase):
 
     def test_dynamic_spacing_and_uniform_grid_respect_bounds(self):
         cfg = load_config(ROOT / "configs" / "example.toml")
-        scan = cfg["scan"]["beta1"]
+        scan = {**cfg["scan"]["beta1"], "fit_sigma_multiplier": 3.0}
         self.assertEqual(_dynamic_fit_spacing(None, scan), 0.01)
         self.assertAlmostEqual(_dynamic_fit_spacing(0.01, scan), 0.03)
         self.assertEqual(_dynamic_fit_spacing(1.0, scan), scan["fit_spacing_max"])

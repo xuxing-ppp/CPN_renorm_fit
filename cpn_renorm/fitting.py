@@ -46,18 +46,23 @@ def fit_one_plaq(X: np.ndarray, freq: np.ndarray, p0: float = .5) -> dict:
             'device': 'cpu', 'success': True}
 
 
+def two_plaq_probability(N: int, X: np.ndarray, beta: float,
+                         alpha_eff: float) -> np.ndarray:
+    """Folded conditional density; X columns are angle and eight boundary features."""
+    x = np.asarray(X, float)
+    U, boundary = np.exp(1j * x[:, 0]), np.exp(1j * x[:, 1:7])
+    overlap = x[:, 7] * np.exp(-1j * x[:, 8])
+    field = (2 * N * beta * overlap + alpha_eff * boundary[:, 0] * boundary[:, 4]
+             * boundary[:, 5] + alpha_eff * np.conj(boundary[:, 1]
+             * boundary[:, 2] * boundary[:, 3]))
+    return np.exp(np.real(U * field) - np.abs(field)) / i0e(np.abs(field)) / (2 * np.pi)
+
+
 def fit_two_plaq(N: int, X: np.ndarray, freq: np.ndarray,
                   p0: tuple[float, float] = (0.5, 0.5)) -> dict:
     X, freq = np.asarray(X, float), np.asarray(freq, float)
-
     def model(x: np.ndarray, beta: float, alpha: float) -> np.ndarray:
-        U, boundary = np.exp(1j * x[:, 0]), np.exp(1j * x[:, 1:7])
-        overlap = x[:, 7] * np.exp(-1j * x[:, 8])
-        field = (2 * N * beta * overlap + alpha * boundary[:, 0] * boundary[:, 4]
-                 * boundary[:, 5] + alpha * np.conj(boundary[:, 1]
-                 * boundary[:, 2] * boundary[:, 3]))
-        # exp(real(UF))/I0(|F|), evaluated without overflow.
-        return np.exp(np.real(U * field) - np.abs(field)) / i0e(np.abs(field)) / (2 * np.pi)
+        return two_plaq_probability(N, x, beta, alpha)
 
     popt, pcov = curve_fit(model, X, freq, p0=p0, bounds=(0, np.inf), maxfev=50000, ftol=1e-11, xtol=1e-11, gtol=1e-12)
     pred = model(X, *popt)
