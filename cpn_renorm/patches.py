@@ -403,7 +403,11 @@ def _obc_topology(sampler: BatchedHMCSampler) -> tuple[torch.Tensor, torch.Tenso
     tri0 = vdot(z00, z10) * vdot(z10, z11) * vdot(z11, z00)
     tri1 = vdot(z00, z11) * vdot(z11, z01) * vdot(z01, z00)
     q_z = (torch.angle(tri0) + torch.angle(tri1)).sum((1, 2)) / (2 * math.pi)
-    q_s = sampler.s[:, :-1, :-1].sum((1, 2)).to(sampler.dtype)
+    # OBC has a nonzero boundary flux. Subtracting the coarse boundary flux
+    # later converts this total flux into the coarse integer Villain winding,
+    # including the branch shifts from wrapping each coarse edge separately.
+    q_s = (da.sum((1, 2)) / (2 * math.pi)
+           + sampler.s[:, :-1, :-1].sum((1, 2)).to(sampler.dtype))
     return q_u, q_z, q_s
 
 

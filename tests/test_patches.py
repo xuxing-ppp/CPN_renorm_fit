@@ -16,6 +16,7 @@ from cpn_renorm.patches import (
     _extract_rectangle,
     _install_rectangle,
     _load_or_generate_batch,
+    _obc_topology,
     _restore_patch,
     _two_plaq_connections,
     patch_result_key,
@@ -25,6 +26,29 @@ from cpn_renorm.sampler import BatchedHMCSampler, Couplings
 
 
 class PatchTests(unittest.TestCase):
+    def test_obc_villain_charge_includes_boundary_flux_and_coarse_branch_shift(self):
+        sampler = BatchedHMCSampler(
+            chains=1, Lx=3, Ly=3, N=2,
+            couplings=Couplings(0, 0, 0.4), kind="full", periodic=False, seed=2)
+        sampler.a.zero_()
+        # The fine bottom edge sums to 4 radians; its coarse phase is 4-2*pi.
+        sampler.a[:, :2, 0, 0] = 2.0
+        sampler.s.zero_()
+        sampler.s[:, 0, 0] = 2
+        rectangle = _extract_rectangle(sampler, width=2, height=2, pad=0)
+        au, _, _ = _boundary_data(rectangle.zloop, rectangle.aloop, L=2, segments=4)
+        boundary_flux = au.sum(1) / (2 * np.pi)
+        qs = _obc_topology(sampler)[2].numpy()
+        self.assertAlmostEqual(float(qs[0]), 2 + 4 / (2 * np.pi), places=12)
+        # One additional winding is needed when the coarse edge is wrapped.
+        np.testing.assert_allclose(qs - boundary_flux, [3], rtol=0, atol=1e-12)
+        # The coordinate entering the fit must equal the actual total flux.
+        np.testing.assert_allclose(
+            2 * np.pi * (qs - boundary_flux) + au.sum(1),
+            (sampler.plaquette_da().sum((1, 2))
+             + 2 * np.pi * sampler.s[:, :-1, :-1].sum((1, 2)).to(sampler.dtype)).numpy(),
+            rtol=0, atol=1e-12)
+
     def test_two_plaq_middle_z_connection_uses_forward_legacy_orientation(self):
         sampler = BatchedHMCSampler(
             chains=1, Lx=5, Ly=3, N=2,
